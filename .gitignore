@@ -1,0 +1,17 @@
+# Test output (generated from made-up data)
+tests/output/
+
+# Never commit real message backups or converted files
+messages-*/
+messages*.zip
+*.ndjson
+data/
+sms-*.xml
+calls-*.xml
+*.manifest.csv
+*.report.txt
+*.partial
+
+.DS_Store
+__pycache__/
+.claude/
