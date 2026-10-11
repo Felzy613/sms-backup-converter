@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#F4F6F9</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="text">#1B1F24</color>
+    <color name="muted">#5B6470</color>
+    <color name="border">#DCE1E7</color>
+    <color name="primary">#1B5FBF</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="primary_soft">#E3ECFA</color>
+    <color name="ok">#1E7B3A</color>
+    <color name="ok_soft">#E2F3E7</color>
+    <color name="bad">#B3261E</color>
+    <color name="bad_soft">#FBE6E4</color>
+    <color name="icon_bg">#1B5FBF</color>
+</resources>

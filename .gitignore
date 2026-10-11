@@ -1,0 +1,18 @@
+# Private message data: never commit an export or a converted backup.
+messages-*/
+*.ndjson
+PART_*
+*.zip
+sms-*.xml
+*.xml.partial
+*.manifest.csv
+*.report.txt
+
+# Builds (the APK is attached to GitHub releases instead)
+*.apk
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store

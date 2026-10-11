@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#111316</color>
+    <color name="surface">#1B1E23</color>
+    <color name="text">#E7EAEE</color>
+    <color name="muted">#9AA3AE</color>
+    <color name="border">#2D3239</color>
+    <color name="primary">#8AB4FF</color>
+    <color name="on_primary">#0A1A33</color>
+    <color name="primary_soft">#1E2B40</color>
+    <color name="ok">#7FD99A</color>
+    <color name="ok_soft">#18301F</color>
+    <color name="bad">#F4B4AE</color>
+    <color name="bad_soft">#3A1D1B</color>
+</resources>
