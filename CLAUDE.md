@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Converts an **SMS Import / Export** export (`messages-YYYY-MM-DD.zip` or its unzipped folder: `messages.ndjson` + `data/PART_*`) into the XML backup format that **SMS Backup & Restore** (SyncTech) restores, then verifies the result.
 
-This folder is the git repo for the public GitHub repo `Felzy613/sms-backup-converter` (`origin`). It merged in the earlier web-only repo `Felzy613/FIg-SMS-to-SyncTech-SMS-Backup-and-Restore` with its history; that repo is being retired. Releases on GitHub carry the APK (`gh release`); the APK itself is gitignored.
+This folder is the git repo for the public GitHub repo `Felzy613/FIg-SMS-to-SyncTech-SMS-Backup-and-Restore` (`origin`). It began as `Felzy613/sms-backup-converter` (Android app + CLI); the original web-only repo of this name was merged into it with its history, deleted, and the merged repo renamed to this name. Releases on GitHub carry the APK (`gh release`); the APK itself is gitignored.
 
 - `messages-2026-09-08 (recovered)/` — the user's **real, private** message export (28,373 messages, ~580 MB), gitignored. Use it only as read-only test input; never modify it, never commit it, and never upload or send its contents anywhere. The repo is public.
 - Three implementations of the converter that must stay in lockstep:
