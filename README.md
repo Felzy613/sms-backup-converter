@@ -1,29 +1,114 @@
 # SMS Backup Converter
 
-Converts a backup made by **SMS Import / Export** (`messages-YYYY-MM-DD.zip`, or its unzipped
-folder) into an XML backup that **SMS Backup & Restore** can restore, then reads the result back
-and checks every message and attachment against the original.
+Move your text messages from an **SMS Import / Export** backup into **SMS Backup & Restore**, so you can restore them on a new Android phone. Texts, picture messages, group chats and attachments are all carried over.
 
-There are three versions, and they produce byte-identical XML:
+- **Private.** It runs entirely on your own device. Nothing is uploaded: the web page is blocked from contacting any server, and the Android app has no internet access at all.
+- **Careful.** Every message is written exactly as stored: numbers, text, timestamps, sent/received, read and delivery status, every MMS part and attachment. Each one is then read back and checked against the original.
+- **Three versions, one result.** A web page, an Android app and a Python command line. All three write byte-identical files.
 
-| | Where | How to run |
+| Version | Use it when | Get it |
 |---|---|---|
-| Android app | [`android`](android) | install the APK from [Releases](../../releases) |
-| Python command line | [`cli/sie_to_sbr.py`](cli/sie_to_sbr.py) | `python3 sie_to_sbr.py convert SOURCE sms-20261005120000.xml` |
-| JavaScript engine | [`assets`](assets) | `node tests/run_js.mjs SOURCE OUTPUT.xml` |
+| **Web page** | you have a computer | open `index.html` in a browser |
+| **Android app** | you only have the phone, including a filtered ("kosher") phone | install the APK from [Releases](../../releases) |
+| **Command line** | you want to script it | `python3 cli/sie_to_sbr.py` |
 
-## The Android app is offline ("kosher")
+## Using the web page
 
-It requests **no permissions at all**, so it cannot use the internet. It has no WebView and no
-links, cannot open web pages or install apps, and uses no third-party libraries. Files are read
-and written only through the system file picker. A build check (`./gradlew :app:kosherCheck`)
-fails if any of that ever changes. See [the app's README](android/README.md).
+1. Download this repository: **Code → Download ZIP** on GitHub, then unzip it.
+2. Open `index.html` in Chrome, Edge, Firefox or Safari.
+3. Choose your `messages-YYYY-MM-DD.zip` from SMS Import / Export, or the folder you unzipped it into.
+4. Click **Create test file**, restore it on the phone (steps below) and check it.
+5. Click **Create full backup** and restore that.
 
-## Using it
+Chrome and Edge save straight to disk, which is best for large backups (hundreds of MB). Other browsers build the file in memory, then download it.
 
-1. Make a small **test file** first, restore it with SMS Backup & Restore, and check that a few
-   conversations look right.
-2. Then convert all messages and restore that file.
+## Using the Android app
 
-Each conversion also writes a `.report.txt` (what was converted and the verification result)
-and a `.manifest.csv` (one row per message).
+Install `SmsBackupConverter-….apk` from [Releases](../../releases) (Android 8.0 or later). Then:
+
+1. Choose the backup ZIP (or the unzipped folder).
+2. Choose a folder to save to. Android 11 and later don't allow the Download folder itself, so create one inside it, for example `Download/SMS`.
+3. Tap **Make a test file**, restore it (steps below) and check it. Then tap **Convert all messages**.
+
+The app is offline by design: it requests **no permissions**, has no WebView and no links, cannot open web pages, and cannot download or install apps. Files are read and written only through Android's own file picker. Details are in [android/README.md](android/README.md).
+
+### Restoring on the phone
+
+1. Install **SMS Backup & Restore** (by SyncTech) from Google Play.
+2. In its *Settings → Backup settings → Local backup folder*, choose or create a folder (for example `SMSBackupRestore`).
+3. Copy the `sms-….xml` file into that folder. Keep the name starting with `sms-`. (The Android app can save straight into that folder.)
+4. Optional: *Menu → View backups* lets you look inside the file without changing anything.
+5. Tap *Restore*, pick the file, tick *Messages* and start. Let the app be your SMS app while it restores, then switch back.
+
+Restore the test file first. Restoring the full backup afterwards skips messages that are already on the phone.
+
+## What the converter does
+
+SMS Import / Export writes `messages.ndjson` (one JSON object per message, with Android's own database columns) and a `data/` folder of MMS attachments. The converter maps these onto the [XML format SMS Backup & Restore reads](https://www.synctech.com.au/sms-backup-restore/fields-in-xml-backup-files/):
+
+| | |
+|---|---|
+| SMS | address, body, date, date sent, type (received/sent/…), read, status, and protocol / locked / service center when present |
+| MMS | every header (message id, transaction id, type, box, subject, read, priority, reports, …) |
+| MMS parts | all parts in their original order, with attachments embedded as base64 |
+| MMS addresses | all From / To / Cc / Bcc rows in their original order |
+| Group chats | each MMS's `address` lists the conversation's other members (joined with `~`, your own number left out), so Android rebuilds the same group conversation |
+| Dates | SMS dates are unchanged. MMS dates are stored in seconds by Android and in milliseconds by SMS Backup & Restore, so they are multiplied by 1000 (which the app reverses on restore). |
+
+Deliberate changes, all listed in the report:
+
+- **SIM id (`sub_id`) is written as -1, meaning "unknown SIM".** Since Android 14, the system hides messages whose SIM id belongs to a different phone; restored messages are expected to use -1 (see AOSP `ProviderUtil.getSelectionBySubIds`). The original ids are kept in the message list (CSV). You can keep them, or set a specific id, under *Options*.
+- **Characters XML can't store are removed.** XML cannot store certain invisible control characters such as NUL, so they are removed, or replaced with `�` if you choose.
+- **Group MMS stay in their group.** If a group MMS lists fewer people in its headers than its group, it is still filed in that group, as it was on the old phone. Its real headers are kept unchanged.
+
+Not available in an SMS Import / Export backup, so not in the result: drafts the messaging app kept to itself, call logs, blocked numbers, and RCS chats Google Messages didn't copy into Android's MMS store.
+
+## Command line
+
+```bash
+python3 cli/sie_to_sbr.py analyze messages-2026-01-15.zip
+python3 cli/sie_to_sbr.py convert messages-2026-01-15.zip sms-test-20260115120000.xml --sample
+python3 cli/sie_to_sbr.py convert messages-2026-01-15.zip sms-20260115120000.xml
+```
+
+`convert` writes the XML, a `.report.txt` and a `.manifest.csv` (one row per message, with its original ids), then re-reads the XML with a strict parser and checks every message against the source.
+
+Options:
+
+| Option | What it does |
+|---|---|
+| `--sub-id unknown\|keep\|N` | SIM id written for every message. Default: `unknown` (-1). |
+| `--tz America/New_York` | Time zone for the human-readable dates. |
+| `--nul strip\|replace` | Remove characters XML can't store, or replace them with `�`. |
+| `--owner +15550100100` | Your own number, if it isn't detected automatically. |
+| `--force` | Overwrite an existing output file. |
+
+It needs only Python 3.8+, with no extra packages.
+
+## Tests
+
+```bash
+python3 tests/test_all.py
+```
+
+The tests need Python 3.9+ and Node 20+, plus a JDK 17 to 24 for the Android engine (it is skipped, with a notice, when none is found). They build a backup full of made-up messages (`tests/make_fixture.py`), then check that:
+
+- The browser engine (`assets/converter.js`), the Android app's engine (`android/core`) and the Python version produce **byte-identical** files across ZIP and folder sources and several option combinations.
+- The Python verifier accepts the other two engines' output.
+- A list of specific results comes out right: group chats, notes to self, empty and missing attachments, emoji and control characters, unconvertible records.
+- The ZIP reader handles ZIP64, data descriptors and damaged files.
+
+The Android app has its own unit tests and an offline audit: see [android/README.md](android/README.md).
+
+## Files
+
+- `index.html`, `assets/`: the web app. `converter.js` is the engine, `zip.js` a small ZIP reader, `app.js` the page.
+- `android/`: the Android app. `core/` is the engine (a Kotlin port of `converter.js` and `zip.js`), `app/` the screens.
+- `cli/sie_to_sbr.py`: the command-line version.
+- `tests/`: the test suite and the made-up test data generator.
+
+## Disclaimer
+
+This project is not affiliated with SyncTech Pty Ltd (SMS Backup & Restore) or the SMS Import / Export project. Keep your original backup until you have checked the restored messages.
+
+[MIT License](LICENSE)

@@ -31,3 +31,16 @@ tasks.register<JavaExec>("cli") {
     maxHeapSize = "2g"
     workingDir = rootDir
 }
+
+// A runnable JAR of the engine's command line (with the Kotlin runtime inside), used by
+// tests/test_all.py to compare this engine with the Python and browser versions:
+//   java -jar core/build/libs/sie-cli.jar convert SOURCE OUTPUT.xml [options]
+tasks.register<Jar>("cliJar") {
+    archiveFileName.set("sie-cli.jar")
+    manifest { attributes["Main-Class"] = "com.smsconverter.sie2sbr.core.CliKt" }
+    from(sourceSets["main"].output)
+    dependsOn(configurations.runtimeClasspath)
+    from({ configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) } })
+    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/versions/**")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}

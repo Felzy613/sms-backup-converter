@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- The page may not contact any server: your messages never leave this device. -->
+  <meta http-equiv="Content-Security-Policy" content="connect-src 'none'; form-action 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'">
+  <meta name="description" content="Convert an SMS Import / Export backup into a file SMS Backup &amp; Restore can restore. Runs entirely in your browser.">
+  <title>SMS Backup Converter</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Cpath d='M8 10h16v10H14l-4 4v-4H8z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <main>
+    <header class="intro">
+      <h1>SMS Backup Converter</h1>
+      <p>Turns an <strong>SMS Import / Export</strong> backup into a file that <strong>SMS Backup &amp; Restore</strong> can restore on your new phone: texts, picture messages, group chats and all.</p>
+      <p class="badge" title="The page is not allowed to contact any server."><span aria-hidden="true">🔒</span> Works offline. Your messages never leave this device.</p>
+    </header>
+
+    <section class="card" id="step-open" aria-labelledby="h-open">
+      <h2 id="h-open"><span class="num">1</span> Open your backup</h2>
+      <p>Choose the <code>messages-YYYY-MM-DD.zip</code> file that SMS Import / Export made, or the folder you unzipped it into (the one that contains <code>messages.ndjson</code> and <code>data</code>).</p>
+      <div class="drop" id="drop" tabindex="-1">
+        <p class="drop-hint">Drop the ZIP file or folder here</p>
+        <div class="buttons">
+          <label class="button primary">Choose ZIP file<input type="file" id="pick-zip" accept=".zip,application/zip" hidden></label>
+          <label class="button">Choose folder<input type="file" id="pick-folder" webkitdirectory hidden></label>
+        </div>
+      </div>
+      <p class="status" id="open-status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="card" id="step-summary" aria-labelledby="h-summary" hidden>
+      <h2 id="h-summary"><span class="num">2</span> What's in it</h2>
+      <dl class="stats" id="stats"></dl>
+      <ul class="notes" id="summary-notes"></ul>
+      <details class="options">
+        <summary>Options</summary>
+        <fieldset>
+          <legend>SIM card id written into each message</legend>
+          <label><input type="radio" name="subid" value="unknown" checked> "Unknown SIM" (recommended)</label>
+          <p class="hint">Android 14 and later hide restored messages whose SIM id belongs to the old phone. "Unknown" (-1) is what Android expects for messages from another device.</p>
+          <label><input type="radio" name="subid" value="keep"> Keep the old phone's ids</label>
+          <label><input type="radio" name="subid" value="custom"> Use this id: <input type="number" id="subid-custom" min="-1" step="1" inputmode="numeric" class="small"></label>
+          <p class="hint">Only if your new phone's messaging app hides the restored messages; see "If the messages don't show up" below.</p>
+        </fieldset>
+        <fieldset>
+          <legend>Characters a backup file cannot store</legend>
+          <label><input type="radio" name="nul" value="strip" checked> Remove them</label>
+          <label><input type="radio" name="nul" value="replace"> Replace them with �</label>
+          <p class="hint">Invisible control characters (such as NUL) that XML files cannot hold. Every change is listed in the report.</p>
+        </fieldset>
+        <fieldset>
+          <legend>Other</legend>
+          <label class="field">Your own phone number <input type="text" id="owner" autocomplete="off" placeholder="detected automatically"></label>
+          <p class="hint" id="owner-hint">Used to rebuild group chats. Only change it if the detected number is wrong.</p>
+          <label class="field">Time zone for the readable dates <input type="text" id="tz" autocomplete="off" spellcheck="false"></label>
+          <p class="hint">Only affects the human-readable date text; the real timestamps are kept exactly.</p>
+          <label><input type="checkbox" id="verify" checked> Double-check every message after writing it (recommended)</label>
+        </fieldset>
+      </details>
+    </section>
+
+    <section class="card" id="step-create" aria-labelledby="h-create" hidden>
+      <h2 id="h-create"><span class="num">3</span> Create the backup files</h2>
+      <p>Make the small <strong>test file</strong> first and restore it on the new phone. If it looks right, make and restore the <strong>full backup</strong>; messages that are already on the phone are skipped.</p>
+      <div class="buttons">
+        <button type="button" class="button" id="make-test">Create test file</button>
+        <button type="button" class="button primary" id="make-full">Create full backup</button>
+      </div>
+      <p class="hint" id="save-hint"></p>
+      <div class="progress" id="progress" hidden>
+        <div class="bar"><div id="bar"></div></div>
+        <p class="status" id="progress-text" role="status" aria-live="polite"></p>
+        <button type="button" class="button small" id="cancel">Cancel</button>
+      </div>
+      <div id="results"></div>
+    </section>
+
+    <section class="card" id="step-restore" aria-labelledby="h-restore">
+      <h2 id="h-restore"><span class="num">4</span> Restore on your new phone</h2>
+      <ol class="steps">
+        <li>Install <strong>SMS Backup &amp; Restore</strong> (by SyncTech) from Google Play and open it.</li>
+        <li>In its <em>Settings → Backup settings → Local backup folder</em>, choose or create a folder, for example <code>SMSBackupRestore</code>.</li>
+        <li>Copy the file you created into that folder on the phone (USB cable, a USB stick, or a cloud drive and the phone's Files app). Keep the name starting with <code>sms-</code>.</li>
+        <li>Optional: <em>Menu → View backups</em> shows what's in the file without changing anything.</li>
+        <li>Tap <em>Restore</em>, pick the file, tick <em>Messages</em> and start. Allow the app to be your SMS app while it restores, then switch back to your usual messaging app.</li>
+        <li>Do the test file first. Check names, times, sent/received sides, photos and group chats. Then restore the full backup the same way.</li>
+      </ol>
+      <details>
+        <summary>If the messages don't show up</summary>
+        <p>Wait a minute and restart the phone. If they are still missing, your phone's messaging app may want a real SIM id instead of "unknown": send one text on the new phone, make a messages backup with SMS Backup &amp; Restore, open that file in a text editor and note the number in <code>sub_id="…"</code>. Then come back here, choose <em>Options → Use this id</em> with that number, and create the files again.</p>
+      </details>
+    </section>
+
+    <footer>
+      <p><a href="https://github.com/Felzy613/sms-backup-converter">Source code and help</a> · <a href="https://github.com/Felzy613/sms-backup-converter/releases">Android app</a> · version <span id="version"></span></p>
+      <p>Not affiliated with SyncTech (SMS Backup &amp; Restore) or the SMS Import / Export project.</p>
+    </footer>
+  </main>
+  <script src="assets/zip.js"></script>
+  <script src="assets/converter.js"></script>
+  <script src="assets/app.js"></script>
+</body>
+</html>

@@ -4,22 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Converts an **SMS Import / Export** export (`messages-YYYY-MM-DD.zip` or its unzipped folder: `messages.ndjson` + `data/PART_*`) into the XML backup format that **SMS Backup & Restore** (SyncTech) restores, then verifies the result. Not a git repository.
+Converts an **SMS Import / Export** export (`messages-YYYY-MM-DD.zip` or its unzipped folder: `messages.ndjson` + `data/PART_*`) into the XML backup format that **SMS Backup & Restore** (SyncTech) restores, then verifies the result.
 
-- `messages-2026-09-08 (recovered)/` — the user's **real, private** message export (28,373 messages, ~580 MB). Use it only as read-only test input; never modify it, and never upload or send its contents anywhere.
-- `sms-ie-to-sbr/` — the converter, in three implementations that must stay in lockstep:
+This folder is the git repo for the public GitHub repo `Felzy613/sms-backup-converter` (`origin`). It merged in the earlier web-only repo `Felzy613/FIg-SMS-to-SyncTech-SMS-Backup-and-Restore` (remote `html`) with its history. Releases on GitHub carry the APK (`gh release`); the APK itself is gitignored.
+
+- `messages-2026-09-08 (recovered)/` — the user's **real, private** message export (28,373 messages, ~580 MB), gitignored. Use it only as read-only test input; never modify it, never commit it, and never upload or send its contents anywhere. The repo is public.
+- Three implementations of the converter that must stay in lockstep:
   - `cli/sie_to_sbr.py` — the reference: Python 3.8+, standard library only (`analyze`, `convert`, `verify` subcommands).
-  - `assets/converter.js` + `assets/zip.js` — a line-for-line port for browsers and Node. The `index.html` and `tests/test_all.py` that the comments mention are not in this folder.
+  - `index.html` + `assets/` — the web app. `converter.js` (engine) and `zip.js` are a line-for-line port for browsers and Node; `app.js` is the page. The page's CSP sets `connect-src 'none'`, so it cannot make network requests; keep it that way.
   - `android/` — the Android app. `core/` is a Kotlin port of `converter.js`/`zip.js` with no Android dependency; `app/` is the UI.
-  - `SmsBackupConverter-1.0.0.apk` — a copy of the latest release build.
+- `tests/` — `test_all.py` (the cross-implementation suite), `make_fixture.py` (a made-up export full of edge cases), `run_js.mjs` (runs the JS engine under Node), `test_zip.mjs`.
+- `SmsBackupConverter-1.0.0.apk` — a local copy of the latest release build (gitignored).
 
 ## The parity invariant
 
-All three implementations must produce **byte-identical XML** and identical `.manifest.csv` files for the same input and options. Only XML line 2 (the comment with the time stamp and time zone label) and line 4 (`<smses ... backup_set=UUID backup_date=...>`) may differ. Any change to conversion logic must be made in all three, then checked on the real export:
+All three implementations must produce **byte-identical XML** and identical `.manifest.csv` files for the same input and options. Only XML line 2 (the comment with the time stamp and time zone label) and line 4 (`<smses ... backup_set=UUID backup_date=...>`) may differ. Any change to conversion logic must be made in all three.
+
+`python3 tests/test_all.py` checks this on the made-up fixture: 4 source layouts × 5 option sets, for the Python, JS and Kotlin engines. The Kotlin engine runs from a JAR built by `./gradlew :core:cliJar`, which needs a JDK 17–24 (it is skipped otherwise). Output goes to `tests/output/`. Then check on the real export too:
 
 ```bash
-cd sms-ie-to-sbr
-SRC="$(cd "../messages-2026-09-08 (recovered)" && pwd)"; OUT="/Volumes/6 Extra Space/Android emulator/work"
+SRC="$(cd "messages-2026-09-08 (recovered)" && pwd)"; OUT="/Volumes/6 Extra Space/Android emulator/work"
 python3 cli/sie_to_sbr.py convert "$SRC" "$OUT/py.xml" --tz America/New_York   # refuses to overwrite without --force
 node tests/run_js.mjs "$SRC" "$OUT/js.xml" --tz America/New_York        # add --sample for the test set
 (cd android && ./gradlew :core:cli -q --args="convert '$SRC' '$OUT/kt.xml' --tz America/New_York")
@@ -44,7 +48,7 @@ Always pass `--tz`, since `readable_date` otherwise uses the machine's zone. Ful
 5. **Verify**: re-read the written file with a strict XML parser (Python `iterparse`; on Android, SAX/Expat) and compare every field and every attachment (by SHA-256) with its source record. Also predicts the conversations after restore. The JS version verifies each element in memory instead.
 6. **Manifest/report**: `.manifest.csv` has one row per message, with the source line, old ids and SIM id; `.report.txt` is the summary plus the verification result.
 
-## Android app (`sms-ie-to-sbr/android`)
+## Android app (`android/`)
 
 The hard requirement is that it be **"kosher": no web browsing and no ability to install APKs.** Preserve all of this:
 - Zero `<uses-permission>`, no AndroidX/Google/third-party libraries (only `:core` and the Kotlin stdlib), no WebView, no `ACTION_VIEW`/`SEND`/web-search intents, and no selectable text.
@@ -65,7 +69,7 @@ Output safety rules (both came from real bugs):
 
 ## Commands
 
-Run from `sms-ie-to-sbr/android`. The system `java` is JDK 8, so set `JAVA_HOME` first. `local.properties` points `sdk.dir` at `/opt/homebrew/share/android-commandlinetools` (platform 35, build-tools 35.0.0).
+`python3 tests/test_all.py` runs from the repo root. The Gradle commands run from `android/`. The system `java` is JDK 8 and Homebrew's default `openjdk` is 26 (too new for this Gradle/Kotlin), so set `JAVA_HOME` first. `local.properties` points `sdk.dir` at `/opt/homebrew/share/android-commandlinetools` (platform 35, build-tools 35.0.0).
 
 ```bash
 export JAVA_HOME=/opt/homebrew/opt/openjdk@21
@@ -75,6 +79,8 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@21
 ./gradlew :core:cli -q --args="convert SOURCE OUT.xml [--sample] [--sub-id unknown|keep|N] [--tz ZONE] [--nul strip|replace] [--owner NUMBERS]"
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
+
+To try the web app, serve the repo root (`.claude/launch.json` has a `web-app` config on port 8791) and load a backup with `window.sieOpenFile(file)`; with `window.showSaveFilePicker` undefined, the result's blob is in `window.__lastResult`.
 
 Python and JS take the same options: `python3 cli/sie_to_sbr.py {analyze|convert|verify} SOURCE [OUTPUT.xml] [options]` and `node tests/run_js.mjs SOURCE OUT.xml [options]`.
 

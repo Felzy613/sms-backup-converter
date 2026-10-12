@@ -1,12 +1,18 @@
-# Private message data: never commit an export or a converted backup.
+# Never commit real message backups or converted files
 messages-*/
+messages*.zip
 *.ndjson
+data/
 PART_*
-*.zip
 sms-*.xml
+calls-*.xml
 *.xml.partial
+*.partial
 *.manifest.csv
 *.report.txt
+
+# Test output (generated from made-up data)
+tests/output/
 
 # Builds (the APK is attached to GitHub releases instead)
 *.apk
@@ -15,4 +21,7 @@ build/
 local.properties
 .idea/
 *.iml
+
 .DS_Store
+__pycache__/
+.claude/
