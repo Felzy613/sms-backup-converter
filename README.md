@@ -8,16 +8,16 @@ There are three versions, and they produce byte-identical XML:
 
 | | Where | How to run |
 |---|---|---|
-| Android app | [`sms-ie-to-sbr/android`](sms-ie-to-sbr/android) | install the APK from [Releases](../../releases) |
-| Python command line | [`sms-ie-to-sbr/cli/sie_to_sbr.py`](sms-ie-to-sbr/cli/sie_to_sbr.py) | `python3 sie_to_sbr.py convert SOURCE sms-20261005120000.xml` |
-| JavaScript engine | [`sms-ie-to-sbr/assets`](sms-ie-to-sbr/assets) | `node sms-ie-to-sbr/tests/run_js.mjs SOURCE OUTPUT.xml` |
+| Android app | [`android`](android) | install the APK from [Releases](../../releases) |
+| Python command line | [`cli/sie_to_sbr.py`](cli/sie_to_sbr.py) | `python3 sie_to_sbr.py convert SOURCE sms-20261005120000.xml` |
+| JavaScript engine | [`assets`](assets) | `node tests/run_js.mjs SOURCE OUTPUT.xml` |
 
 ## The Android app is offline ("kosher")
 
 It requests **no permissions at all**, so it cannot use the internet. It has no WebView and no
 links, cannot open web pages or install apps, and uses no third-party libraries. Files are read
 and written only through the system file picker. A build check (`./gradlew :app:kosherCheck`)
-fails if any of that ever changes. See [the app's README](sms-ie-to-sbr/android/README.md).
+fails if any of that ever changes. See [the app's README](android/README.md).
 
 ## Using it
 
