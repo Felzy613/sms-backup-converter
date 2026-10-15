@@ -6,6 +6,7 @@ data/
 PART_*
 sms-*.xml
 calls-*.xml
+Messages_Backup_*
 *.xml.partial
 *.partial
 *.manifest.csv

@@ -26,6 +26,7 @@ import android.view.textclassifier.TextClassifier
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -134,20 +135,22 @@ class MainActivity : Activity() {
 
     private fun header() {
         text(content, getString(R.string.app_name), 24f, bold = true)
-        text(content, "SMS Import / Export  →  SMS Backup & Restore", 14f, R.color.muted, top = 2)
+        text(content, "Fig · TAK · Wonder · Pom · Buggy Backup · SMS Backup & Restore", 14f, R.color.muted, top = 2)
     }
 
     private fun start() {
         val c = card()
-        text(c, "Convert a message backup", 18f, bold = true)
-        text(c, "This turns the backup made by the app SMS Import / Export (a file named like " +
-            "messages-2026-09-08.zip) into a backup file that the app SMS Backup & Restore can restore.", top = 8)
+        text(c, "Move your messages to another phone", 18f, bold = true)
+        text(c, "This turns the message backup of your old phone into one your new phone can restore, even when the " +
+            "two phones use different formats: Fig, TAK, Wonder, Pom, Buggy Backup, or SMS Backup & Restore (any " +
+            "Android phone, including the MindPhone).", top = 8)
         text(c, "Everything happens on this phone. This app has no internet access, and your backup is only read, " +
             "never changed.", 14f, R.color.muted, top = 8)
-        button(content, "Choose the backup ZIP file", primary = true, top = 20) { pickZip() }
-        button(content, "Choose an unzipped backup folder", primary = false, top = 10) { pickFolder() }
-        text(content, "Use the folder option if the ZIP file was already unzipped: choose the folder that " +
-            "contains messages.ndjson and the data folder.", 13f, R.color.muted, top = 10)
+        button(content, "Choose the backup file", primary = true, top = 20) { pickZip() }
+        button(content, "Choose an unzipped Fig or TAK folder", primary = false, top = 10) { pickFolder() }
+        text(content, "The backup file is a .zip file (Fig, TAK, Wonder, Pom, Buggy Backup) or an SMS Backup & Restore " +
+            ".xml file. Use the folder option only if a Fig or TAK backup was unzipped: choose the folder that contains " +
+            "messages.ndjson.", 13f, R.color.muted, top = 10)
     }
 
     private fun busy(s: Session.Busy) {
@@ -176,7 +179,7 @@ class MainActivity : Activity() {
         val s = Session.summary ?: return start()
         val src = Session.source
         val c = card()
-        text(c, "Backup", 13f, R.color.muted, bold = true)
+        text(c, "Backup from " + (FORMAT_NAMES[src?.format] ?: ""), 13f, R.color.muted, bold = true)
         text(c, src?.label ?: "", 17f, bold = true, top = 2)
         val dates = listOfNotNull(day(s.first), day(s.last))
         if (dates.size == 2) text(c, "${dates[0]}  to  ${dates[1]}", 14f, R.color.muted, top = 2)
@@ -188,7 +191,7 @@ class MainActivity : Activity() {
         when {
             !owner.isNullOrBlank() -> text(c, "Your number: $owner (entered by you)", 14f, top = 10)
             s.owner.isNotEmpty() -> text(c, "Your number: " + s.owner.joinToString(", ") + " (found in the backup)", 14f, top = 10)
-            else -> text(c, "Your number was not found in the backup. Group messages may be filed under the wrong " +
+            s.mms > 0 -> text(c, "Your number was not found in the backup. Group messages may be filed under the wrong " +
                 "conversation; enter it under More options.", 14f, R.color.bad, top = 10)
         }
         val unconvertible = s.problems.size + s.bad
@@ -196,6 +199,8 @@ class MainActivity : Activity() {
             text(c, "${fmt(unconvertible)} damaged or incomplete record(s) cannot be converted; they are listed in the report.",
                 14f, R.color.bad, top = 6)
         }
+
+        target(src?.format)
 
         val tree = savedTree()
         val usable = Session.treeUsable(this, tree)
@@ -209,8 +214,8 @@ class MainActivity : Activity() {
             pickOutput()
         }
 
-        text(content, "Start with a small test file. Restore it with SMS Backup & Restore and check that a few " +
-            "conversations look right, then convert everything.", 14f, R.color.muted, top = 20)
+        text(content, "Start with a small test file. Restore it on the new phone and check that a few conversations " +
+            "look right, then convert everything.", 14f, R.color.muted, top = 20)
         button(content, "Make a test file (a few messages)", primary = true, top = 12) { startConvert(true) }
         val total = s.sms + s.mms - s.problems.size
         button(content, "Convert all ${fmt(total)} messages", primary = false, top = 10) { startConvert(false) }
@@ -224,9 +229,81 @@ class MainActivity : Activity() {
         button(content, "Choose a different backup", primary = false, flat = true, top = 4) { Session.reset() }
     }
 
+    /** The new phone's format and what to keep. */
+    private fun target(from: String?) {
+        val t = card()
+        text(t, "Make a backup for", 15f, bold = true)
+        val to = RadioGroup(this)
+        val sbr = radio(to, "SMS Backup & Restore: any Android phone, including the MindPhone")
+        val fig = radio(to, "Fig or TAK (imported with SMS Import / Export)")
+        val wonder = radio(to, "Wonder")
+        t.addView(to, lp(top = 4))
+        val hint = text(t, "", 13f, R.color.muted, top = 4)
+        fun hintFor(target: String) {
+            hint.text = when {
+                target == "fig" && from == "sie" -> "This backup is already a Fig / TAK backup: it can be restored on a Fig or TAK " +
+                    "as it is. Convert it only to leave things out."
+                target == "wonder" -> "Wonder backups keep the main parts of each message (texts, dates, pictures, group members)."
+                else -> ""
+            }
+            hint.visibility = if (hint.text.isEmpty()) View.GONE else View.VISIBLE
+        }
+        to.check(when (Session.options.to) {
+            "fig" -> fig.id
+            "wonder" -> wonder.id
+            else -> sbr.id
+        })
+        hintFor(Session.options.to)
+        to.setOnCheckedChangeListener { _, id ->
+            val v = when (id) {
+                fig.id -> "fig"
+                wonder.id -> "wonder"
+                else -> "sbr"
+            }
+            Session.options = Session.options.copy(to = v)
+            hintFor(v)
+        }
+
+        text(t, "What to keep", 15f, bold = true, top = 18)
+        val keep = RadioGroup(this)
+        val all = radio(keep, "Everything")
+        val sms = radio(keep, "Only text messages (SMS)")
+        val mms = radio(keep, "Only picture and group messages (MMS)")
+        t.addView(keep, lp(top = 4))
+        keep.check(when (Session.options.keep) {
+            "sms" -> sms.id
+            "mms" -> mms.id
+            else -> all.id
+        })
+        keep.setOnCheckedChangeListener { _, id ->
+            Session.options = Session.options.copy(keep = when (id) {
+                sms.id -> "sms"
+                mms.id -> "mms"
+                else -> "all"
+            })
+        }
+        checkBox(t, "Leave out group chats", Session.options.noGroups) { Session.options = Session.options.copy(noGroups = it) }
+        checkBox(t, "Leave out PDF files", Session.options.noPdf) { Session.options = Session.options.copy(noPdf = it) }
+        text(t, "Leaving things out makes the new backup smaller; some phones' messaging apps cannot show PDF files.",
+            13f, R.color.muted, top = 4)
+    }
+
     private fun options(detected: List<String>) {
         val c = card()
-        text(c, "Time zone", 15f, bold = true)
+        text(c, "Big backups", 15f, bold = true)
+        text(c, "Save the backup as several files of at most this size. Restore them in order, part 1 first.",
+            13f, R.color.muted, top = 2)
+        var size: EditText? = null
+        checkBox(c, "Save in parts", Session.splitOn) {
+            Session.splitOn = it
+            size?.isEnabled = it
+            size?.alpha = if (it) 1f else 0.4f
+        }
+        size = edit(c, Session.splitText, "MB per part, e.g. 500", InputType.TYPE_CLASS_NUMBER) { Session.splitText = it.trim() }
+        size.isEnabled = Session.splitOn
+        size.alpha = if (Session.splitOn) 1f else 0.4f
+
+        text(c, "Time zone", 15f, bold = true, top = 18)
         text(c, "Used only for the date text shown inside the backup file; message times are kept exactly.", 13f, R.color.muted, top = 2)
         val zones = ZoneId.getAvailableZoneIds().filter { '/' in it && !it.startsWith("Etc/") && !it.startsWith("SystemV/") }
             .sorted().toMutableList()
@@ -291,37 +368,60 @@ class MainActivity : Activity() {
     }
 
     private fun done(s: Session.Done) {
+        val many = s.files.size > 1
         val c = card(if (s.passed) R.color.ok_soft else R.color.bad_soft)
         if (s.passed) {
             text(c, "✓  Ready to restore", 20f, R.color.ok, bold = true)
-            text(c, "The saved file was read back and checked against your backup: every message and attachment matches.", top = 6)
+            text(c, "The saved " + (if (many) "files were" else "file was") + " read back and checked against your backup: every " +
+                "message and attachment matches.", top = 6)
         } else {
             text(c, "✗  Verification failed", 20f, R.color.bad, bold = true)
-            text(c, if (s.xmlName.endsWith(".partial")) "Do not restore this file. It was kept under a name SMS Backup & Restore " +
-                "will not offer, and the report explains what did not match." else "Do not restore this file; delete it. The report " +
-                "explains what did not match.", top = 6)
+            text(c, "Do not restore " + (if (many) "these files" else "this file") + ". A file that failed is kept under a name " +
+                "ending in .partial, and the report explains what did not match.", top = 6)
             for (e in s.errors.take(8)) text(c, "•  $e", 14f, R.color.bad, top = 4)
         }
 
         val f = card()
-        text(f, if (s.sample) "Test file" else "Backup file", 13f, R.color.muted, bold = true)
-        text(f, s.xmlName, 17f, bold = true, top = 2)
+        text(f, (if (s.sample) "Test file" else "Backup") + " for " + TARGET_LABELS[s.to] + if (many) ", in ${s.files.size} parts" else "",
+            13f, R.color.muted, bold = true)
+        for (name in s.files) text(f, name, 17f, bold = true, top = 2)
         text(f, "in ${s.folder}", 14f, R.color.muted, top = 2)
         fact(f, fmt(s.sms + s.mms), "messages: ${fmt(s.sms)} SMS and ${fmt(s.mms)} MMS")
         fact(f, fmt(s.attachments), "attachments")
-        fact(f, fmt(s.conversations), "conversations after restoring")
-        text(f, "Also saved there: ${s.reportName} and a .manifest.csv list of every message.", 13f, R.color.muted, top = 10)
+        s.conversations?.let { fact(f, fmt(it), "conversations after restoring") }
+        val left = listOfNotNull(s.leftOut["mms"]?.takeIf { it > 0 }?.let { "${fmt(it)} MMS" },
+            s.leftOut["sms"]?.takeIf { it > 0 }?.let { "${fmt(it)} SMS" },
+            s.leftOut["groups"]?.takeIf { it > 0 }?.let { "${fmt(it)} group messages" },
+            s.leftOut["pdf"]?.takeIf { it > 0 }?.let { "${fmt(it)} PDF files" })
+        if (left.isNotEmpty()) text(f, "Left out as you chose: " + left.joinToString(", ") + ".", 14f, top = 8)
+        text(f, "Also saved there: ${s.reportName} and a .manifest.csv list of every message" + (if (many) " for each part." else "."),
+            13f, R.color.muted, top = 10)
 
         if (s.passed) {
             val n = card()
             text(n, "Next", 15f, bold = true)
-            text(n, "Open SMS Backup & Restore, tap Restore, choose the local backup, pick ${s.xmlName} from " +
-                "${s.folder}, and follow its steps.", top = 4)
+            val name = if (many) "${s.files.first()} to ${s.files.last()}" else s.files.first()
+            val steps = when (s.to) {
+                "fig" -> "Copy $name to the Fig or TAK phone (don't unzip it). Open its message backup / restore screen " +
+                    "(SMS Import / Export), choose Import, and pick the file."
+                "wonder" -> "Copy $name to the Wonder phone (don't unzip it). Open its message backup screen, choose " +
+                    "Restore, and pick the file."
+                else -> "Open SMS Backup & Restore, tap Restore, choose the local backup, pick $name from ${s.folder}, and " +
+                    "follow its steps."
+            }
+            text(n, steps, top = 4)
+            if (many) text(n, "Restore part 1 first, then the other parts in order. Each one adds its messages; nothing is lost.",
+                14f, top = 8)
             if (s.sample) {
                 text(n, "This test file holds only a few messages. After restoring it and checking the conversations, " +
-                    "come back and convert all messages. (If the test messages appear twice after the full restore, " +
-                    "SMS Backup & Restore can skip duplicates.)", 14f, R.color.muted, top = 8)
+                    "come back and convert all messages.", 14f, R.color.muted, top = 8)
             }
+            text(n, "Good to know", 15f, bold = true, top = 14)
+            text(n, "•  A phone that already has messages keeps them. Restoring adds the old messages to the same chats " +
+                "and skips any that are already there, so nothing shows up twice.", 14f, top = 4)
+            text(n, "•  The MindPhone restores with SMS Backup & Restore. A Fig and a TAK use the same format: a backup " +
+                "from one restores on the other as it is.", 14f, top = 4)
+            text(n, "•  Keep your original backup until you have checked the restored messages.", 14f, top = 4)
         }
 
         if (s.sample && s.passed) button(content, "Convert all messages", primary = true, top = 20) { startConvert(false) }
@@ -357,12 +457,24 @@ class MainActivity : Activity() {
     // ----------------------------------------------------------------------- actions
 
     private fun startConvert(sample: Boolean) {
-        val o = Session.options
+        var o = Session.options
         if (o.subId != "unknown" && o.subId != "keep" && !isInt(o.subId)) {
             alert("Enter the SIM number under More options, or choose another SIM setting.")
             Session.showOptions = true
             render()
             return
+        }
+        if (Session.splitOn) {
+            val mb = Session.splitText.toDoubleOrNull()
+            if (mb == null || mb <= 0) {
+                alert("Enter how many MB each part may have under More options, or turn off saving in parts.")
+                Session.showOptions = true
+                render()
+                return
+            }
+            o = o.copy(splitMb = mb)
+        } else {
+            o = o.copy(splitMb = 0.0)
         }
         val tree = savedTree()
         if (!Session.treeUsable(this, tree)) {
@@ -391,7 +503,7 @@ class MainActivity : Activity() {
         addCategory(Intent.CATEGORY_OPENABLE)
         type = "*/*"
         putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/zip", "application/x-zip-compressed", "application/x-zip",
-            "application/octet-stream"))
+            "application/octet-stream", "text/xml", "application/xml"))
     }, REQ_ZIP)
 
     private fun pickFolder() = launch(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_FOLDER)
@@ -529,6 +641,19 @@ class MainActivity : Activity() {
         return b
     }
 
+    private fun checkBox(parent: LinearLayout, label: String, checked: Boolean, onChange: (Boolean) -> Unit): CheckBox {
+        val b = CheckBox(this)
+        b.text = label
+        b.textSize = 15f
+        b.setTextColor(color(R.color.text))
+        b.buttonTintList = ColorStateList.valueOf(color(R.color.primary))
+        b.setTextClassifier(TextClassifier.NO_OP)
+        b.isChecked = checked
+        b.setOnCheckedChangeListener { _, v -> onChange(v) }
+        parent.addView(b, lp(top = 2))
+        return b
+    }
+
     private fun radio(group: RadioGroup, label: String): RadioButton {
         val r = RadioButton(this)
         r.id = View.generateViewId()
@@ -599,5 +724,8 @@ class MainActivity : Activity() {
         private const val REQ_FOLDER = 2
         private const val REQ_OUTPUT = 3
         private val DAY = DateTimeFormatter.ofPattern("MMM d, yyyy", Locale.US)
+        private val FORMAT_NAMES = mapOf("sie" to "Fig / TAK", "sbr" to "SMS Backup & Restore", "wonder" to "Wonder",
+            "pom" to "Pom", "buggy" to "Buggy Backup")
+        private val TARGET_LABELS = mapOf("sbr" to "SMS Backup & Restore", "fig" to "Fig / TAK", "wonder" to "Wonder")
     }
 }

@@ -8,7 +8,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const APP = 'sms-ie-to-sbr';
   const INSERT_TOKEN = 'insert-address-token';  // Android's placeholder for the phone's own number
   const UNKNOWN_SUB_ID = '-1';                  // SubscriptionManager.INVALID_SUBSCRIPTION_ID

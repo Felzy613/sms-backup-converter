@@ -28,7 +28,7 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CancellationException
 
-const val VERSION = "1.0.0"
+const val VERSION = "1.1.0"
 const val APP = "sms-ie-to-sbr"
 const val INSERT_TOKEN = "insert-address-token"  // Android's placeholder for the phone's own number
 const val UNKNOWN_SUB_ID = "-1"                  // SubscriptionManager.INVALID_SUBSCRIPTION_ID

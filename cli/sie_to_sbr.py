@@ -58,7 +58,7 @@ import zipfile
 import zlib
 import xml.etree.ElementTree as ET
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 INSERT_TOKEN = 'insert-address-token'  # Android's placeholder for the phone's own number
 UNKNOWN_SUB_ID = '-1'                  # SubscriptionManager.INVALID_SUBSCRIPTION_ID
 

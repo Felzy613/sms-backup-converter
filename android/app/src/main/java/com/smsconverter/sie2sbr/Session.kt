@@ -12,14 +12,18 @@ import com.smsconverter.sie2sbr.core.Plan
 import com.smsconverter.sie2sbr.core.Source
 import com.smsconverter.sie2sbr.core.SourceException
 import com.smsconverter.sie2sbr.core.Summary
+import com.smsconverter.sie2sbr.core.Verification
+import com.smsconverter.sie2sbr.core.WrittenFile
 import com.smsconverter.sie2sbr.core.ZipException
-import com.smsconverter.sie2sbr.core.convert
 import com.smsconverter.sie2sbr.core.fileStamp
 import com.smsconverter.sie2sbr.core.load
 import com.smsconverter.sie2sbr.core.manifest
+import com.smsconverter.sie2sbr.core.prepare
 import com.smsconverter.sie2sbr.core.report
 import com.smsconverter.sie2sbr.core.summarize
 import com.smsconverter.sie2sbr.core.verify
+import com.smsconverter.sie2sbr.core.verifyZip
+import com.smsconverter.sie2sbr.core.writePart
 import java.io.Closeable
 import java.io.File
 import java.io.IOException
@@ -35,9 +39,10 @@ object Session {
     object Start : State()
     class Busy(val title: String, val detail: String, val fraction: Float?, val cancellable: Boolean) : State()
     object Ready : State()
+    /** files: the names of the saved backup files (several when split into parts). */
     class Done(
-        val passed: Boolean, val sample: Boolean, val xmlName: String, val folder: String,
-        val sms: Int, val mms: Int, val attachments: Int, val conversations: Int,
+        val passed: Boolean, val sample: Boolean, val to: String, val files: List<String>, val folder: String,
+        val sms: Int, val mms: Int, val attachments: Int, val conversations: Int?, val leftOut: Map<String, Int>,
         val errors: List<String>, val reportName: String, val report: String,
     ) : State()
     class Failed(val message: String, val backToReady: Boolean) : State()
@@ -57,6 +62,9 @@ object Session {
     /** The options as last chosen on the screen (owner and SIM number as typed). */
     var options = Options()
     var showOptions = false
+    /** "Save in parts" and the size typed for it (kept as typed until converting). */
+    var splitOn = false
+    var splitText = "500"
     var showReport = false
 
     private val main = Handler(Looper.getMainLooper())
@@ -121,18 +129,19 @@ object Session {
         thread(name = "open") {
             try {
                 File(app.cacheDir, "source.zip").delete()
+                app.cacheDir.listFiles { f -> f.name.startsWith("sms-convert-") }?.forEach { it.deleteRecursively() }
                 val src = if (folder) Saf.openFolder(app, uri) else {
-                    val (s, c) = Saf.openZip(app, uri) { done, total ->
+                    val (s, c) = Saf.openFile(app, uri) { done, total ->
                         progress("Copying the backup", if (total > 0) done.toFloat() / total else null, false) { mb(done) + " copied" }
                     }
                     closer = c
                     s
                 }
                 source = src
-                val total = src.ndjsonSize
+                val total = src.loadSize
                 val ld = load(src, { done ->
                     progress("Reading messages", if (total > 0) done.toFloat() / total else null) {
-                        "${percent(done, total)} of messages.ndjson"
+                        if (total > 0) percent(done, total) + " read" else mb(done) + " read"
                     }
                 }, { cancelled })
                 set(Busy("Checking the messages", "${ld.msgs.size} messages read", null, false))
@@ -154,66 +163,95 @@ object Session {
         }
     }
 
-    /** Converts with the given options into the chosen folder, verifies the saved file, and
-     *  writes the manifest and report next to it. */
+    /** The file names SMS Backup & Restore, SMS Import / Export and Wonder give their backups. */
+    private fun fileName(to: String, sample: Boolean, now: ZonedDateTime): String {
+        val ymd = "%04d-%02d-%02d".format(Locale.ROOT, now.year, now.monthValue, now.dayOfMonth)
+        return when (to) {
+            "fig" -> (if (sample) "messages-test-" else "messages-") + ymd + ".zip"
+            "wonder" -> (if (sample) "Messages_Backup_test_" else "Messages_Backup_") + ymd + ".zip"
+            else -> (if (sample) "sms-test-" else "sms-") + fileStamp(now) + ".xml"
+        }
+    }
+
+    /** Converts with the given options into the chosen folder: each output file (several when
+     *  split into parts) is written under a temporary name, synced to storage, checked (an SMS
+     *  Backup & Restore file is re-read with a strict XML parser, a ZIP is re-read entry by
+     *  entry), and only then given its real name. The manifests and report go next to them. */
     fun convert(ctx: Context, opts: Options, tree: Uri) {
         val app = ctx.applicationContext
         val src = source ?: return
         val ld = loaded ?: return
-        val detected = plan ?: return
         cancelled = false
         showReport = false
         state = Busy("Preparing", "", null, true)
         listener?.invoke()
         thread(name = "convert") {
             val folder = Saf.OutputFolder(app, tree)
-            var xml: Uri? = null
+            var current: Uri? = null
             try {
-                val p = if (opts.owner.isNullOrBlank()) detected else Plan(ld.msgs, opts.owner)
                 val now = ZonedDateTime.now()
-                val base = (if (opts.sample) "sms-test-" else "sms-") + fileStamp(now)
-                // The XML keeps a temporary name until it has passed verification, so a half-written
-                // or failed file is never offered by SMS Backup & Restore as a backup.
-                var doc = folder.create("$base.xml.partial", "application/octet-stream")
-                xml = doc
-                val renamable = folder.canRename(doc)
-                if (!renamable) {
-                    folder.delete(doc)
-                    doc = folder.create("$base.xml", "text/xml")
-                    xml = doc
-                }
-                val result = folder.writeSynced(doc) { out ->
-                    convert(src, ld, p, opts, out, now, { i, n ->
-                        progress("Writing messages", i.toFloat() / n) { "${fmt(i)} of ${fmt(n)}" }
-                    }, { cancelled })
-                }
-                val verification = (app.contentResolver.openInputStream(doc) ?: throw IOException("Could not read the saved file back."))
-                    .use { input ->
-                        verify(input, result, { done ->
-                            progress("Checking the saved file", done.toFloat() / result.bytes) {
-                                mb(done) + " of " + mb(result.bytes)
-                            }
+                val job = prepare(src, ld, opts, now)
+                if (job.chosen.isEmpty()) throw IllegalStateException("No message is left with these \"what to keep\" choices.")
+                val name = fileName(opts.to, opts.sample, now)
+                val ext = name.substring(name.lastIndexOf('.'))
+                val stem = name.dropLast(ext.length)
+                val n = job.parts.size
+                val written = ArrayList<WrittenFile>()
+                val names = ArrayList<String>()
+                for (k in 0 until n) {
+                    val target = if (n == 1) name else "$stem-part${k + 1}$ext"
+                    val label = if (n == 1) "" else "Part ${k + 1} of $n: "
+                    // A temporary name until the file has passed its check, so a half-written or
+                    // failed file is never offered as a backup.
+                    var doc = folder.create("$target.partial", "application/octet-stream")
+                    current = doc
+                    val renamable = folder.canRename(doc)
+                    if (!renamable) {
+                        folder.delete(doc)
+                        doc = folder.create(target, if (opts.to == "sbr") "text/xml" else "application/zip")
+                        current = doc
+                    }
+                    val part = folder.writeSynced(doc) { out ->
+                        writePart(job, k, out, { i, total ->
+                            progress(label + if (opts.to == "sbr") "Writing messages" else "Adding attachments",
+                                (k + i.toFloat() / total) / n) { "${fmt(i)} of ${fmt(total)}" }
                         }, { cancelled })
                     }
+                    val verification: Verification = if (opts.to == "sbr") {
+                        (app.contentResolver.openInputStream(doc) ?: throw IOException("Could not read the saved file back.")).use { input ->
+                            verify(input, job, part.msgs, { done ->
+                                progress(label + "Checking the saved file", (k + done.toFloat() / part.bytes) / n) {
+                                    mb(done) + " of " + mb(part.bytes)
+                                }
+                            }, { cancelled })
+                        }
+                    } else {
+                        set(Busy(label + "Checking the saved file", "Reading it back", null, false))
+                        folder.randomInput(doc).use { verifyZip(it, job, part) }
+                    }
+                    if (renamable && verification.ok) doc = folder.rename(doc, target)
+                    current = null  // keep it from here on
+                    val savedName = folder.nameOf(doc) ?: target
+                    names.add(savedName)
+                    folder.write(savedName.substringBeforeLast('.') + ".manifest.csv", "application/octet-stream", manifest(job, part.msgs))
+                    written.add(WrittenFile(savedName, part.bytes, verification))
+                }
                 set(Busy("Saving the report", "", null, false))
-                if (renamable && verification.ok) doc = folder.rename(doc, "$base.xml")
-                xml = null  // keep it from here on
-                val xmlName = folder.nameOf(doc) ?: "$base.xml"
-                folder.write("$base.manifest.csv", "application/octet-stream", manifest(result))
-                val reportText = report(result, xmlName, verification)
-                val reportName = folder.write("$base.report.txt", "text/plain", reportText)
-                set(Done(verification.ok, opts.sample, xmlName, folder.name,
-                    result.chosen.count { it.isSms }, result.chosen.count { it.isMms },
-                    result.conv.attachments - result.conv.attachmentsMissing, verification.conversations,
-                    verification.errors, reportName, reportText))
+                val reportText = report(job, written)
+                val reportName = folder.write("$stem.report.txt", "text/plain", reportText)
+                val conv = job.conv
+                set(Done(written.all { it.verification?.ok == true }, opts.sample, opts.to, names, folder.name,
+                    job.chosen.count { it.isSms }, job.chosen.count { it.isMms }, conv.attachments - conv.attachmentsMissing,
+                    if (opts.to == "sbr" && n == 1) written[0].verification?.conversations else null, job.leftOut,
+                    written.flatMap { it.verification?.errors ?: emptyList() }, reportName, reportText))
             } catch (e: CancellationException) {
-                xml?.let { folder.delete(it) }
+                current?.let { folder.delete(it) }
                 set(Ready)
             } catch (e: OutOfMemoryError) {
-                xml?.let { folder.delete(it) }
+                current?.let { folder.delete(it) }
                 set(Failed("This phone ran out of memory while converting.", true))
             } catch (e: Exception) {
-                xml?.let { folder.delete(it) }
+                current?.let { folder.delete(it) }
                 set(Failed(explain(e), true))
             }
         }
@@ -228,7 +266,7 @@ object Session {
         }
 
     private fun explain(e: Exception): String = when (e) {
-        is SourceException, is ZipException -> e.message ?: "This backup could not be read."
+        is SourceException, is ZipException, is IllegalStateException -> e.message ?: "This backup could not be read."
         is IOException -> "A file could not be read or written: " + (e.message ?: e.javaClass.simpleName) +
             ". Check that there is enough free space and try again."
         else -> "Something went wrong: " + (e.message ?: e.javaClass.simpleName)

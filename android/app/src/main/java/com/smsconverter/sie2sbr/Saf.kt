@@ -11,12 +11,14 @@ import com.smsconverter.sie2sbr.core.Source
 import com.smsconverter.sie2sbr.core.SourceFile
 import com.smsconverter.sie2sbr.core.ZipArchive
 import com.smsconverter.sie2sbr.core.ZipException
-import com.smsconverter.sie2sbr.core.ZipSource
+import com.smsconverter.sie2sbr.core.openBackupXml
+import com.smsconverter.sie2sbr.core.openBackupZip
 import java.io.Closeable
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.io.SyncFailedException
@@ -32,10 +34,12 @@ object Saf {
         null
     }
 
-    /** Opens a picked ZIP file. A local file is read in place; anything that cannot be read at
-     *  random positions is first copied into the app's cache (deleted again on close). */
-    fun openZip(ctx: Context, uri: Uri, copyProgress: (Long, Long) -> Unit): Pair<Source, Closeable> {
-        val label = displayName(ctx, uri) ?: "backup.zip"
+    /** Opens a picked backup file: a ZIP (Fig / TAK, Wonder, Pom, Buggy Backup, or SMS Backup
+     *  & Restore zipped) or an SMS Backup & Restore XML file. A local file is read in place;
+     *  anything that cannot be read at random positions is first copied into the app's cache
+     *  (deleted again on close). Attachments inside XML are unpacked into the cache too. */
+    fun openFile(ctx: Context, uri: Uri, copyProgress: (Long, Long) -> Unit): Pair<Source, Closeable> {
+        val label = displayName(ctx, uri) ?: "backup"
         val cr = ctx.contentResolver
         val pfd = cr.openFileDescriptor(uri, "r") ?: throw IOException("Could not open $label.")
         val total = pfd.statSize
@@ -45,19 +49,19 @@ object Saf {
                 fis.close()
                 pfd.close()
             }
-            try {
-                val zip = ZipArchive(RandomInput(fis.channel, closer))
-                return ZipSource(zip, label) to zip
-            } catch (e: IOException) {
+            val zip = try {
+                ZipArchive(RandomInput(fis.channel, closer))
+            } catch (e: ZipException) {
                 closer.close()
-                if (e is ZipException) throw e  // not a ZIP file: copying would not help
+                if (!notZip(e)) throw e
+                return xml(ctx, label, total) { cr.openInputStream(uri) ?: throw IOException("Could not open $label.") }
             } catch (e: Exception) {
                 closer.close()
                 throw e
             }
-        } else {
-            pfd.close()
+            return fromZip(ctx, zip, label)
         }
+        pfd.close()
         val tmp = File(ctx.cacheDir, "source.zip")
         (cr.openInputStream(uri) ?: throw IOException("Could not open $label.")).use { input ->
             tmp.outputStream().use { out ->
@@ -73,11 +77,44 @@ object Saf {
             }
         }
         val raf = RandomAccessFile(tmp, "r")
-        val zip = ZipArchive(RandomInput(raf.channel, Closeable {
+        val zip = try {
+            ZipArchive(RandomInput(raf.channel, Closeable {
+                raf.close()
+                tmp.delete()
+            }))
+        } catch (e: ZipException) {
             raf.close()
-            tmp.delete()
-        }))
-        return ZipSource(zip, label) to zip
+            if (!notZip(e)) {
+                tmp.delete()
+                throw e
+            }
+            val (src, closer) = xml(ctx, label, tmp.length()) { tmp.inputStream() }
+            return src to Closeable {
+                closer.close()
+                tmp.delete()
+            }
+        }
+        return fromZip(ctx, zip, label)
+    }
+
+    private fun notZip(e: ZipException) = e.message?.startsWith("This file is not a ZIP archive") == true
+
+    private fun fromZip(ctx: Context, zip: ZipArchive, label: String): Pair<Source, Closeable> {
+        val src = try {
+            openBackupZip(zip, label, ctx.cacheDir)
+        } catch (e: Exception) {
+            zip.close()
+            throw e
+        }
+        return src to Closeable {
+            src.close()
+            zip.close()
+        }
+    }
+
+    private fun xml(ctx: Context, label: String, size: Long, open: () -> InputStream): Pair<Source, Closeable> {
+        val src = openBackupXml(open, label, size, ctx.cacheDir)
+        return src to src
     }
 
     private class Child(val id: String, val name: String, val mime: String, val size: Long) {
@@ -179,6 +216,29 @@ object Saf {
         }
 
         fun nameOf(doc: Uri): String? = displayName(ctx, doc)
+
+        /** A saved document, for reading at random positions (to check a ZIP output). Copied into
+         *  the cache first if its storage provider cannot do that. */
+        fun randomInput(doc: Uri): RandomInput {
+            val pfd = cr.openFileDescriptor(doc, "r") ?: throw IOException("Could not read the saved file back.")
+            if (pfd.statSize >= 0) {
+                val fis = FileInputStream(pfd.fileDescriptor)
+                return RandomInput(fis.channel, Closeable {
+                    fis.close()
+                    pfd.close()
+                })
+            }
+            pfd.close()
+            val tmp = File(ctx.cacheDir, "check.zip")
+            (cr.openInputStream(doc) ?: throw IOException("Could not read the saved file back.")).use { input ->
+                tmp.outputStream().use { input.copyTo(it) }
+            }
+            val raf = RandomAccessFile(tmp, "r")
+            return RandomInput(raf.channel, Closeable {
+                raf.close()
+                tmp.delete()
+            })
+        }
 
         /** Writes doc and forces the data onto storage before returning. A plain stream can leave
          *  it in memory for a while, so a crash or flat battery right afterwards would leave an
