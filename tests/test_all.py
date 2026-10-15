@@ -8,10 +8,16 @@
    manifests, a passing self-check, and the Python verifier passing the other engines'
    output.
 3. Checks specific results in the XML against hand-written expectations.
-4. Runs the ZIP reader's unit tests (ZIP64, stored entries, damage detection, CP437).
+4. Does the same for the other formats: SMS Backup & Restore, Wonder, Pom and Buggy Backup
+   backups (also made up) converted to every output format (SMS Backup & Restore, Fig /
+   TAK, Wonder) with several option sets, including the "what to keep" options and
+   splitting into parts; then checks each format's tricky cases, a round trip through the
+   Fig / TAK format, and that splitting loses nothing.
+5. Runs the ZIP reader's unit tests (ZIP64, stored entries, damage detection, CP437).
 Output goes to tests/output/ (ignored by git).
 """
 
+import json
 import os
 import re
 import shutil
@@ -82,9 +88,8 @@ def kotlin_engine():
     return [os.path.join(home, 'bin', 'java'), '-jar', KT_JAR]
 
 
-def equivalence():
+def equivalence(kt_cmd):
     print('Python CLI vs browser engine vs Android engine (byte-identical XML and manifest, all verified):')
-    kt_cmd = kotlin_engine()
     sources = {'folder': 'messages-2026-01-15', 'zip': 'messages-2026-01-15.zip',
                'zip with data descriptors': 'messages-descriptors.zip', 'zip inside a folder': 'messages-prefixed.zip'}
     option_sets = {'default': [], 'test sample': ['--sample'], 'keep SIM ids': ['--sub-id', 'keep'],
@@ -160,6 +165,152 @@ def expectations():
     check(all(x.get('readable_date') and x.get('contact_name') for x in root), 'every message has readable_date and contact_name')
 
 
+def parts_of(path):
+    """The files a conversion wrote: OUTPUT, or OUTPUT-part1, -part2, ... when split."""
+    stem, ext = os.path.splitext(path)
+    parts = [p for p in os.listdir(os.path.dirname(path)) if re.fullmatch(re.escape(os.path.basename(stem)) + r'-part\d+' +
+                                                                         re.escape(ext), p)]
+    parts.sort(key=lambda p: int(re.search(r'-part(\d+)', p).group(1)))
+    return [os.path.join(os.path.dirname(path), p) for p in parts] or [path]
+
+
+def content(path):
+    """What must be identical between the engines: an XML file without its time stamps,
+    or a ZIP file's entry names and contents."""
+    if path.endswith('.xml'):
+        lines = open(path, encoding='utf-8').read().split('\n')
+        return [lines[0], lines[2], re.sub(r'backup_set="[^"]*" backup_date="[0-9]+"', '', lines[3])] + lines[4:]
+    with zipfile.ZipFile(path) as z:
+        return [(n, z.read(n)) for n in z.namelist()]
+
+
+def formats(kt_cmd):
+    print('Other formats: every source x output format x options (Python vs browser engine vs Android engine, '
+          'files identical and verified):')
+    sources = ['sbr-2026-01-15.xml', 'sbr-zipped.zip', 'wonder-2026-01-15.zip', 'pom-2026-01-15.zip',
+               'buggy-2026-01-15.zip', 'messages-2026-01-15.zip']
+    option_sets = {'default': [], 'test sample': ['--sample'],
+                   'MMS only, no groups, no PDF': ['--keep', 'mms', '--no-groups', '--no-pdf'],
+                   'split into parts': ['--split-mb', '0.004'], 'texts only, SIM kept': ['--keep', 'sms', '--sub-id', 'keep']}
+    engines = {'py': [sys.executable, CLI, 'convert'], 'js': ['node', RUN_JS]}
+    if kt_cmd:
+        engines['kt'] = kt_cmd + ['convert']
+    for src in sources:
+        for to in ('sbr', 'fig', 'wonder'):
+            if src.startswith('messages') and to == 'sbr':
+                continue  # covered above
+            ext = '.xml' if to == 'sbr' else '.zip'
+            for oname, opts in option_sets.items():
+                tag = re.sub(r'\W+', '-', '%s-%s-%s' % (src, to, oname))
+                results, errors = {}, []
+                for e, cmd in engines.items():
+                    out = os.path.join(OUT, 'fmt-%s-%s%s' % (e, tag, ext))
+                    r = run(cmd + [os.path.join(OUT, src), out, '--to', to, '--force'] + opts + TZ)
+                    if r.returncode:
+                        errors.append('%s: %s' % (e, (r.stdout + r.stderr)[-600:]))
+                        continue
+                    files = parts_of(out)
+                    results[e] = ([content(f) for f in files], [open(f[:-4] + '.manifest.csv', 'rb').read() for f in files])
+                same = not errors and all(results[e] == results['py'] for e in results)
+                check(same, '%s -> %s, %s' % (src, to, oname))
+                if not same:
+                    print('\n'.join(errors) or '  outputs differ between %s' % ', '.join(results))
+                if to == 'sbr' and not errors and 'split' not in oname:
+                    for e in engines:
+                        if e != 'py':
+                            out = os.path.join(OUT, 'fmt-%s-%s%s' % (e, tag, ext))
+                            v = run([sys.executable, CLI, 'verify', os.path.join(OUT, src), out] + opts + TZ)
+                            if v.returncode:
+                                check(False, 'the Python verifier accepts the %s output (%s)' % (e, tag))
+                                print(v.stdout[-800:])
+
+
+def format_expectations():
+    print('Other formats: specific results:')
+    py = lambda src, to, oname, ext='.xml': os.path.join(OUT, 'fmt-py-%s%s' % (re.sub(r'\W+', '-', '%s-%s-%s' % (src, to, oname)), ext))
+
+    def messages(path):
+        root = ET.parse(path).getroot()
+        return root, {e.get('body'): e for e in root.iter('sms')}, list(root.iter('mms'))
+
+    root, sms, mms = messages(py('sbr-2026-01-15.xml', 'sbr', 'default'))
+    check(sms['Hi from SBR & friends <3'].get('contact_name') == 'Alex Example', 'SMS Backup & Restore: entities and contact names')
+    check('Line one\nLine two\r\nthree' in sms, 'SMS Backup & Restore: character references for line breaks are kept')
+    check('literal line break and tab' in sms, 'SMS Backup & Restore: a literal line break in an attribute becomes a space, as XML says')
+    check("emoji \U0001F600 and \U0001F600 'x'" in sms, 'SMS Backup & Restore: emoji written as character references')
+    check('single "quoted" attribute' in sms, 'SMS Backup & Restore: single-quoted attributes')
+    check(sms['null'].get('body') == 'null', 'SMS Backup & Restore: a text that says "null" is kept')
+    parts = {p.get('cl'): p for p in root.iter('part')}
+    check(parts['wrapped.png'].get('data') == parts['image0.png'].get('data') and len(parts['image0.png'].get('data')) > 40,
+          'SMS Backup & Restore: base64 split over lines is decoded to the same picture')
+    check(parts['empty.jpg'].get('data') == '' and parts['broken.jpg'].get('data') is None,
+          'SMS Backup & Restore: an empty attachment stays empty, invalid base64 is reported as missing')
+    group = next(m for m in mms if m.get('msg_box') == '2')
+    check([a.get('address') for a in group.iter('addr')] == ['+15550100202', '+15550100100', '+15550100201', '+15550100203']
+          and set(group.get('address').split('~')) == {'+15550100201', '+15550100202', '+15550100203'},
+          'SMS Backup & Restore: address rows keep their order; the group keeps its members')
+    root, sms, mms = messages(py('sbr-2026-01-15.xml', 'sbr', 'MMS only, no groups, no PDF'))
+    check(not sms and len(mms) == 2 and not any(p.get('ct') == 'application/pdf' for p in root.iter('part')),
+          '"what to keep": MMS only, without the group MMS and the PDF')
+
+    root, sms, mms = messages(py('wonder-2026-01-15.zip', 'sbr', 'default'))
+    parts = {p.get('cl'): p for p in root.iter('part')}
+    check(len(parts['photo.jpg'].get('data') or '') == 4000 and parts['lost.jpg'].get('data') is None and
+          parts['menu.pdf'].get('data'), 'Wonder: attachments from mms_attachments/ are embedded; a missing one is reported')
+    check({p.get('seq') for p in root.iter('part') if p.get('ct') == 'application/smil'} == {'-1'} and
+          {p.get('seq') for p in root.iter('part') if p.get('ct') != 'application/smil'} == {'0'}, 'Wonder: part order numbers are filled in')
+    check(mms[0].get('date') == str((T0 + 103 * 60) * 1000), 'Wonder: MMS dates in seconds become milliseconds')
+
+    root, sms, mms = messages(py('pom-2026-01-15.zip', 'sbr', 'default'))
+    check(all('/TYPE=PLMN' not in (a.get('address') or '') for a in root.iter('addr')), 'Pom: "/TYPE=PLMN" is removed from addresses')
+    check([a.get('address') for a in mms[1].iter('addr')] == ['+15550100201'] and mms[1].get('address') == '+15550100201',
+          'Pom: an MMS that lists only recipients (<r>) gets their address')
+    check(any(p.get('cl') == 'pic.png' and p.get('data') for p in root.iter('part')), 'Pom: _data_b64 attachments are embedded')
+
+    root, sms, mms = messages(py('buggy-2026-01-15.zip', 'sbr', 'default'))
+    check([e.get('body') for e in root.iter('sms')] == ['Buggy hello', 'Buggy reply \U0001F44D', 'Buggy tenth (sorted after conv_2)'],
+          'Buggy Backup: entries in number order (conv_10 after conv_2)')
+    check([e.get('read') for e in root.iter('sms')] == ['1', '1', '0'] and sms['Buggy hello'].get('protocol') == '0',
+          'Buggy Backup: true/false and numbers become column values')
+    report = open(py('buggy-2026-01-15.zip', 'sbr', 'default')[:-4] + '.report.txt', encoding='utf-8').read()
+    check('records:           5 records (0 blank, 2 unreadable)' in report, 'Buggy Backup: damaged entries are reported')
+
+    with zipfile.ZipFile(py('sbr-2026-01-15.xml', 'fig', 'default', '.zip')) as z:
+        lines = [json.loads(x) for x in z.read('messages.ndjson').decode('utf-8').splitlines()]
+        names = z.namelist()
+    mms_rows = [o for o in lines if '__parts' in o]
+    files = [p['_data'].rsplit('/', 1)[-1] for o in mms_rows for p in o['__parts'] if '_data' in p]
+    check(all(int(o['date']) < 10 ** 11 for o in mms_rows) and files == [n[5:] for n in names[1:]] and
+          not any(p.get('cl') == 'broken.jpg' and '_data' in p for o in mms_rows for p in o['__parts']),
+          'Fig / TAK output: MMS dates in seconds, every attachment file in data/, none for the broken one')
+    check([o['_id'] for o in lines] == [str(i) for i in range(1, len(lines) + 1)] and
+          len({o['thread_id'] for o in lines}) == 6, 'Fig / TAK output: row ids and one thread per conversation')
+
+    direct = os.path.join(OUT, 'roundtrip-direct.xml')
+    via = os.path.join(OUT, 'roundtrip-fig.zip')
+    back = os.path.join(OUT, 'roundtrip-back.xml')
+    a = run([sys.executable, CLI, 'convert', os.path.join(OUT, 'messages-2026-01-15.zip'), direct, '--force'] + TZ)
+    b = run([sys.executable, CLI, 'convert', os.path.join(OUT, 'messages-2026-01-15.zip'), via, '--to', 'fig', '--force'] + TZ)
+    c = run([sys.executable, CLI, 'convert', via, back, '--force'] + TZ)
+    check(not (a.returncode or b.returncode or c.returncode) and same_xml(direct, back),
+          'Fig / TAK round trip: Fig -> Fig ZIP -> SMS Backup & Restore equals Fig -> SMS Backup & Restore')
+
+    for src in ('sbr-2026-01-15.xml', 'wonder-2026-01-15.zip'):
+        one = parts_of(py(src, 'sbr', 'default'))
+        split = parts_of(py(src, 'sbr', 'split into parts'))
+        def count(files):
+            out = []
+            for f in files:
+                for e in ET.parse(f).getroot():
+                    e.tail = None
+                    out.append(ET.tostring(e))
+            return sorted(out)
+        check(len(one) == 1 and len(split) > 1 and count(one) == count(split),
+              'splitting %s into %d parts keeps every message exactly once' % (src, len(split)))
+    for src in ('sbr-2026-01-15.xml', 'wonder-2026-01-15.zip', 'pom-2026-01-15.zip', 'buggy-2026-01-15.zip'):
+        check(len(messages(py(src, 'sbr', 'test sample'))[0]) > 0, 'a test file from %s holds messages' % src)
+
+
 def zip_tests():
     print('ZIP reader:')
     work = os.path.join(OUT, 'zip-tests')
@@ -198,8 +349,11 @@ def main():
     r = run([sys.executable, os.path.join(HERE, 'make_fixture.py'), OUT])
     if r.returncode:
         sys.exit(r.stderr)
-    equivalence()
+    kt_cmd = kotlin_engine()
+    equivalence(kt_cmd)
     expectations()
+    formats(kt_cmd)
+    format_expectations()
     zip_tests()
     well_formed()
     print('\n%s' % ('ALL TESTS PASSED' if not failures else '%d FAILED' % len(failures)))

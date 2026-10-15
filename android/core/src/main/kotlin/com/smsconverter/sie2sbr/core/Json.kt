@@ -23,6 +23,9 @@ class JNum(val text: String) {
 class JObj(private val keys: Array<String>, private val values: Array<Any?>) {
     val keyList: List<String> get() = keys.asList()
 
+    /** The columns in order, as a map that can be changed (for building an output record). */
+    fun toMap(): LinkedHashMap<String, Any?> = LinkedHashMap<String, Any?>().also { for (i in keys.indices) it[keys[i]] = values[i] }
+
     fun has(key: String) = indexOf(key) >= 0
 
     /** The value (JNull for JSON null), or null when the key is not present. */

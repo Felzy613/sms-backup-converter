@@ -32,12 +32,14 @@ class EngineTest {
         SourceFile("export/data/PART_1", jpeg.size.toLong()) { ByteArrayInputStream(jpeg) },
     ), "export")
 
-    private fun run(src: Source, opts: Options = Options(tz = "UTC")): Pair<Result, ByteArray> {
-        val loaded = load(src)
+    private fun run(src: Source, opts: Options = Options(tz = "UTC")): Pair<Job, ByteArray> {
+        val job = prepare(src, load(src), opts)
         val out = ByteArrayOutputStream()
-        val result = convert(src, loaded, Plan(loaded.msgs, opts.owner), opts, out)
-        return result to out.toByteArray()
+        writePart(job, 0, out)
+        return job to out.toByteArray()
     }
+
+    private fun verifyXml(job: Job, xml: ByteArray) = verify(ByteArrayInputStream(xml), job, job.parts[0])
 
     @Test
     fun convertsAndVerifies() {
@@ -53,18 +55,18 @@ class EngineTest {
         assertTrue("date=\"1700000200000\"" in text)  // MMS seconds -> milliseconds
         assertTrue("data=\"" + java.util.Base64.getEncoder().encodeToString(jpeg) + "\"" in text)
         assertEquals(1, result.conv.changes.size)  // the U+0000
-        val v = verify(ByteArrayInputStream(xml), result)
+        val v = verifyXml(result, xml)
         assertTrue(v.ok, v.lines.joinToString("\n"))
         assertEquals(1, v.conversations)
-        assertTrue(report(result, "x.xml", v).contains("result: PASSED"))
-        assertTrue(manifest(result).startsWith("xml_index,kind,direction"))
+        assertTrue(report(result, listOf(WrittenFile("x.xml", xml.size.toLong(), v))).contains("result: PASSED"))
+        assertTrue(manifest(result, result.parts[0]).startsWith("xml_index,kind,direction"))
     }
 
     @Test
     fun verificationCatchesChanges() {
         val (result, xml) = run(folder())
         val text = String(xml, Charsets.UTF_8)
-        fun check(changed: String) = verify(ByteArrayInputStream(changed.toByteArray()), result)
+        fun check(changed: String) = verifyXml(result, changed.toByteArray())
         assertFalse(check(text.replace("ok 😀", "ok")).ok)                    // a body
         assertFalse(check(text.replace("data=\"AB", "data=\"AC")).ok)         // an attachment byte
         assertFalse(check(text.replace("<smses count=\"4\"", "<smses count=\"5\"")).ok)
@@ -77,6 +79,78 @@ class EngineTest {
         val (result, _) = run(folder(), Options(tz = "UTC", sample = true, subId = "keep", owner = "555 123 4567"))
         assertEquals(setOf("5551234567"), result.plan.owner)
         assertTrue(result.chosen.isNotEmpty())
+    }
+
+    private val sbrXml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<!-- made-up test data -->
+<smses count="3">
+  <sms address="+15551234567" date="1700000000000" type="1" body="Tom &amp; Jerry&#10;line 2" read="1" status="null" contact_name="Ann" />
+  <sms address="+15551234567" date="1700000100000" type="2" body="literal
+break" read="1" contact_name="(Unknown)" />
+  <mms date="1700000200000" msg_box="1" m_type="132" read="1" address="+15551234567" contact_name="Ann">
+    <parts>
+      <part seq="0" ct="image/jpeg" cl="a.jpg" text="null" data="${java.util.Base64.getEncoder().encodeToString(ByteArray(10) { it.toByte() })}" />
+      <part seq="0" ct="application/pdf" cl="b.pdf" text="null" data="JVBERg==" />
+      <part seq="0" ct="text/plain" text="hello" />
+    </parts>
+    <addrs>
+      <addr address="+15559998888" type="151" charset="106" />
+      <addr address="+15551234567" type="137" charset="106" />
+    </addrs>
+  </mms>
+</smses>
+"""
+
+    @Test
+    fun readsSmsBackupAndRestore() {
+        val src = openBackupXml({ ByteArrayInputStream(sbrXml.toByteArray()) }, "sms.xml", sbrXml.length.toLong())
+        src.use {
+            assertEquals("sbr", src.format)
+            val loaded = load(src)
+            assertEquals(listOf("sms", "sms", "mms"), loaded.msgs.map { it.kind })
+            assertEquals("Tom & Jerry\nline 2", sval(loaded.msgs[0].o, "body"))
+            assertEquals("literal break", sval(loaded.msgs[1].o, "body"))  // XML attribute-value normalization
+            assertEquals("Ann", sval(loaded.msgs[0].o, "__display_name"))
+            assertNull(sval(loaded.msgs[1].o, "__display_name"))
+            assertNull(sval(loaded.msgs[0].o, "status"))  // "null"
+            val mms = loaded.msgs[2]
+            assertEquals(listOf("+15559998888", "+15551234567"), mms.addrRows.map { sval(it, "address") })  // order kept
+            assertEquals(setOf("ATT_1", "ATT_2"), src.names)
+            assertEquals(10L, src.partSize("ATT_1"))
+            // MMS only, without the PDF, as SMS Backup & Restore XML and as a Fig / TAK ZIP
+            val opts = Options(tz = "UTC", keep = "mms", noPdf = true)
+            val (job, xml) = run(src, opts)
+            assertEquals(1, job.chosen.size)
+            assertEquals(1, job.leftOut["pdf"])
+            assertFalse("b.pdf" in String(xml, Charsets.UTF_8))
+            assertTrue(verifyXml(job, xml).ok)
+            val fig = prepare(src, loaded, opts.copy(to = "fig"))
+            val zipped = ByteArrayOutputStream().also { writePart(fig, 0, it) }.toByteArray()
+            val f = File.createTempFile("figout", ".zip").apply { deleteOnExit(); writeBytes(zipped) }
+            val zip = java.util.zip.ZipFile(f)
+            assertEquals(listOf("messages.ndjson", "data/PART_1"), zip.entries().toList().map { it.name })
+            val line = zip.getInputStream(zip.getEntry("messages.ndjson")).readBytes().toString(Charsets.UTF_8)
+            assertTrue(line.startsWith("{\"_id\":\"1\",\"thread_id\":\"1\",\"date\":\"1700000200\","), line)
+            assertTrue("\"_data\":\"$APP_PARTS" + "PART_1\"" in line, line)
+            zip.close()
+        }
+    }
+
+    @Test
+    fun jsonLikeJavaScript() {
+        val b = StringBuilder()
+        jsonTo(b, linkedMapOf("a" to "q\"\\\n\u0001\uD800😀/", "n" to JNum("12"), "t" to true, "z" to JNull, "l" to listOf("x")))
+        assertEquals("{\"a\":\"q\\\"\\\\\\n\\u0001\\ud800😀/\",\"n\":12,\"t\":true,\"z\":null,\"l\":[\"x\"]}", b.toString())
+    }
+
+    @Test
+    fun splitsKeepingConversations() {
+        val src = folder()
+        val opts = Options(tz = "UTC", splitMb = 0.004)
+        val job = prepare(src, load(src), opts)
+        assertTrue(job.parts.size > 1)
+        assertEquals(job.chosen.toSet(), job.parts.flatten().toSet())
+        assertEquals(job.chosen.size, job.parts.sumOf { it.size })
     }
 
     /** A ZIP written the way Android writes it: deflated entries with data descriptors. */

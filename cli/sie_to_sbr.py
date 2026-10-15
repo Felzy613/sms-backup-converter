@@ -1,31 +1,42 @@
 #!/usr/bin/env python3
 """
-sie_to_sbr.py - convert an "SMS Import / Export" export into an XML backup that
-"SMS Backup & Restore" (SyncTech) can restore, then verify the result.
+sie_to_sbr.py - convert a message backup from one phone's format to another's, then
+verify the result. Made for moving texts between kosher phones and ordinary Android.
 
-SOURCE  The export written by SMS Import / Export (com.github.tmo1.sms_ie, v2 or
-        later): either the original messages-YYYY-MM-DD.zip or its extracted folder.
-          messages.ndjson  one JSON object per line: SMS rows (the columns of
-                           Android's content://sms) and MMS rows (content://mms)
-                           plus the keys the app adds: __display_name,
-                           __sender_address, __recipient_addresses, __parts
-          data/PART_*      MMS attachment files, matched to a part by the file
-                           name at the end of the part's "_data" path
-TARGET  The XML format restored by SMS Backup & Restore:
-        https://www.synctech.com.au/sms-backup-restore/fields-in-xml-backup-files/
+SOURCE  (detected from the file's contents)
+  Fig / TAK   SMS Import / Export (com.github.tmo1.sms_ie) export, the original
+              messages-YYYY-MM-DD.zip or its extracted folder:
+                messages.ndjson  one JSON object per line: SMS rows (the columns of
+                                 Android's content://sms) and MMS rows (content://mms)
+                                 plus __display_name, __sender_address,
+                                 __recipient_addresses, __parts
+                data/PART_*      MMS attachment files, matched to a part by the file
+                                 name at the end of the part's "_data" path
+  SMS Backup & Restore  its sms-*.xml file (attachments inside, as base64)
+  Wonder      a ZIP with one XML file (<messages>) and mms_attachments/
+  Pom         a ZIP with sms.xml and mms.xml (attachments inside as _data_b64)
+  Buggy Backup  a ZIP with conversations/conv_N (one JSON message each; SMS only)
+TARGET  --to sbr     (default) the XML restored by SMS Backup & Restore:
+                     https://www.synctech.com.au/sms-backup-restore/fields-in-xml-backup-files/
+        --to fig     a messages.ndjson + data/ ZIP, as SMS Import / Export (Fig, TAK) imports
+        --to wonder  a ZIP with Messages_Backup_YYYY-MM-DD.xml and mms_attachments/
 
-The source is only ever opened for reading. Standard library only (Python 3.8+).
-The browser app (index.html / assets/converter.js) produces byte-identical XML;
-tests/test_all.py checks that.
+Every format is read into the same records (the columns of Android's message tables)
+and written from them. The source is only ever opened for reading. Standard library
+only (Python 3.8+). The browser app (index.html / assets/converter.js) and the Android
+app (android/core) write byte-identical files; tests/test_all.py checks that.
 
   python3 sie_to_sbr.py analyze SOURCE
   python3 sie_to_sbr.py convert SOURCE sms-20261005120000.xml
   python3 sie_to_sbr.py convert SOURCE sms-test-20261005120000.xml --sample
+  python3 sie_to_sbr.py convert SOURCE messages-2026-10-05.zip --to fig --keep sms
   python3 sie_to_sbr.py verify  SOURCE sms-20261005120000.xml
 
-`convert` always runs `verify` on the file it wrote, and also writes
-<output>.manifest.csv (one row per written message, with its source line, old
-row id, thread id and SIM id) and <output>.report.txt.
+`convert` always checks the file(s) it wrote (SMS Backup & Restore XML is re-read with
+a strict parser and matched field by field; ZIP outputs are re-read and compared), and
+also writes <output>.manifest.csv (one row per written message, with its source record,
+old row id, thread id and SIM id) and <output>.report.txt. With --split-mb, outputs
+bigger than that are written as <output>-part1, -part2, ..., to be restored in order.
 """
 
 import argparse
@@ -37,9 +48,14 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import struct
 import sys
+import tempfile
+import time
 import uuid
 import zipfile
+import zlib
 import xml.etree.ElementTree as ET
 
 VERSION = '1.0.0'
@@ -82,13 +98,30 @@ ADDR_ATTRS = ['address', 'type', 'charset']
 SMS_TYPES = {'1': 'received', '2': 'sent', '3': 'draft', '4': 'outbox', '5': 'failed', '6': 'queued'}
 MMS_BOXES = {'1': 'received', '2': 'sent', '3': 'draft', '4': 'outbox'}
 
+TARGETS = ('sbr', 'fig', 'wonder')
+TARGET_NAMES = {'sbr': 'SMS Backup & Restore XML', 'fig': 'Fig / TAK (SMS Import / Export ZIP)',
+                'wonder': 'Wonder ZIP'}
+APP_PARTS = '/data/user_de/0/com.android.providers.telephony/app_parts/'  # where Android keeps MMS files
+# Buggy Backup stores each SMS as JSON with one-letter keys; these are the Android columns.
+BUGGY_KEYS = (('q', 'address'), ('r', 'body'), ('m', 'date'), ('n', 'date_sent'), ('h', 'type'), ('b', 'read'),
+              ('k', 'protocol'), ('g', 'status'), ('d', 'locked'), ('l', 'sub_id'), ('o', 'creator'), ('e', 'seen'))
+# File name extensions for attachments written to a Wonder ZIP.
+EXTENSIONS = {'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/bmp': 'bmp',
+              'image/webp': 'webp', 'audio/amr': 'amr', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'video/mp4': 'mp4',
+              'video/3gpp': '3gp', 'application/pdf': 'pdf', 'text/x-vcard': 'vcf', 'text/vcard': 'vcf'}
+
 
 # ----------------------------------------------------------------------------- source
 
-class Source:
-    """Read-only access to an SMS Import / Export export (zip file or extracted folder)."""
+class SieSource:
+    """Read-only access to an SMS Import / Export export (zip file or extracted folder).
+    Fig and TAK phones write this format; so did Pom's older system."""
 
-    def __init__(self, path):
+    format = 'sie'
+    describe = 'Fig / TAK: SMS Import / Export (com.github.tmo1.sms_ie) export: messages.ndjson + data/'
+    unit = 'line'
+
+    def __init__(self, path, zf=None):
         self.path = os.path.abspath(path)
         self.zip = None
         if os.path.isdir(self.path):
@@ -98,9 +131,9 @@ class Source:
                 sys.exit('error: %s not found' % self.ndjson)
             self.data_dir = os.path.join(self.path, 'data')
             self.names = set(os.listdir(self.data_dir)) if os.path.isdir(self.data_dir) else set()
-        elif zipfile.is_zipfile(self.path):
+        else:
             self.kind = 'zip'
-            self.zip = zipfile.ZipFile(self.path)
+            self.zip = zf or zipfile.ZipFile(self.path)
             members = self.zip.namelist()
             found = [n for n in members if n.rsplit('/', 1)[-1] == 'messages.ndjson']
             if not found:
@@ -110,8 +143,6 @@ class Source:
             self.members = {n[len(prefix):]: n for n in members
                             if n.startswith(prefix) and not n.endswith('/')}
             self.names = set(self.members)
-        else:
-            sys.exit('error: %s is neither a folder nor a zip file' % path)
 
     def lines(self):
         f = self.zip.open(self.ndjson) if self.zip else open(self.ndjson, 'rb')
@@ -126,9 +157,294 @@ class Source:
         with open(os.path.join(self.data_dir, name), 'rb') as f:
             return f.read()
 
+    def part_size(self, name):
+        if self.zip:
+            return self.zip.getinfo(self.members[name]).file_size
+        return os.path.getsize(os.path.join(self.data_dir, name))
+
+    def load(self):
+        msgs, bad, blank = [], [], 0
+        for number, raw in self.lines():
+            if not raw.strip():
+                blank += 1
+                continue
+            try:
+                o = json.loads(raw.decode('utf-8'))
+            except (UnicodeDecodeError, ValueError) as e:
+                bad.append((number, 'unreadable line: %s' % e))
+                continue
+            kind = classify(o)
+            if kind:
+                msgs.append(Msg(number, kind, o))
+            else:
+                bad.append((number, 'line is not a JSON object' if not isinstance(o, dict)
+                            else 'neither an SMS nor an MMS record'))
+        return msgs, bad, blank
+
+    def close(self):
+        pass
+
+
+def classify(o):
+    """'sms', 'mms', or None for a record that is neither."""
+    if not isinstance(o, dict):
+        return None
+    if pick(o, K_PARTS) is not None or 'msg_box' in o or 'm_type' in o:
+        return 'mms'
+    if 'body' in o or 'address' in o:
+        return 'sms'
+    return None
+
+
+class AttachmentStore:
+    """Attachments that a backup keeps inside its XML as base64 (SMS Backup & Restore,
+    Pom): decoded into a temporary folder while reading, so a backup of several GB never
+    has to fit in memory. Each one is named ATT_<n>, n counting in document order."""
+
+    B64 = re.compile('[A-Za-z0-9+/]*={0,2}')
+
+    def __init__(self, workdir=None):
+        self.dir = tempfile.mkdtemp(prefix='sms-convert-', dir=workdir)
+        self.sizes = {}
+        self.count = 0
+
+    def add(self, text):
+        """Stores base64 text; returns its name. Text that is not valid base64 gets a name
+        too, but no file, so the part is reported as an attachment missing from the backup."""
+        self.count += 1
+        name = 'ATT_%d' % self.count
+        b64 = re.sub('[ \t\r\n]', '', text)
+        if len(b64) % 4 == 0 and self.B64.fullmatch(b64):
+            data = base64.b64decode(b64)
+            with open(os.path.join(self.dir, name), 'wb') as f:
+                f.write(data)
+            self.sizes[name] = len(data)
+        return name
+
+    def read(self, name):
+        with open(os.path.join(self.dir, name), 'rb') as f:
+            return f.read()
+
+    def close(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def from_attrs(attrs, skip=()):
+    """A record from XML attributes: SMS Backup & Restore writes NULL columns as "null"."""
+    return {k: (None if v == 'null' else v) for k, v in attrs.items() if k not in skip}
+
+
+def xml_records(f, flavor, store):
+    """Yields ('sms'|'mms', record) for each message in an XML backup, in document order.
+
+    flavor 'sbr'    <smses><sms/><mms><parts><part data=base64/></parts><addrs><addr/></addrs></mms>
+           'wonder' <messages><sms/><mms><addr/><part file=NAME text=.../></mms>
+           'pom'    sms.xml <smses><sms/>; mms.xml <mmses><mms><addr/><r/><part _data_b64=.../></mms>
+    Attribute values become the record's columns ("null" -> None); computed attributes
+    (readable_date, contact_name, an MMS's address) are left out."""
+    mms, parts, rows, recips = None, [], [], []
+    root = None
+    for event, el in ET.iterparse(f, events=('start', 'end')):
+        tag = el.tag
+        if event == 'start':
+            if root is None:
+                root = el
+                continue
+            a = el.attrib
+            if mms is None:
+                if tag == 'sms':
+                    o = from_attrs(a, ('readable_date', 'contact_name'))
+                    if a.get('body') == 'null':
+                        o['body'] = 'null'  # a text that says "null"
+                    name = a.get('contact_name')
+                    if name not in (None, '', 'null', '(Unknown)'):
+                        o['__display_name'] = name
+                    yield 'sms', o
+                elif tag == 'mms':
+                    mms, parts, rows, recips = from_attrs(a, ('address', 'readable_date', 'contact_name')), [], [], []
+            elif tag == 'part':
+                p = from_attrs(a, ('data', '_data_b64', 'file'))
+                if 'seq' not in a:
+                    p['seq'] = '-1' if a.get('ct') == 'application/smil' else '0'
+                if flavor == 'sbr' and 'data' in a:
+                    p['_data'] = store.add(a['data'])
+                elif flavor == 'pom' and a.get('_data_b64') not in (None, '', 'null'):
+                    p['_data'] = store.add(a['_data_b64'])
+                elif flavor == 'wonder' and a.get('file'):
+                    p['_data'] = a['file'].replace('\\', '/').rsplit('/', 1)[-1]
+                parts.append(p)
+            elif tag == 'addr':
+                r = from_attrs(a)
+                if flavor == 'pom' and r.get('address'):
+                    r['address'] = re.sub('/TYPE=PLMN$', '', r['address'], flags=re.I)
+                rows.append(r)
+            elif tag == 'r' and flavor == 'pom' and a.get('address'):
+                recips.append(a['address'])
+        else:
+            if tag == 'mms' and mms is not None:
+                if not rows:
+                    rows = [{'address': x, 'type': '151', 'charset': '106'} for x in recips]
+                rows = [r if '_id' in r else dict([('_id', str(i))] + list(r.items())) for i, r in enumerate(rows, 1)]
+                sender = next((r for r in rows if r.get('type') == '137'), None)
+                if sender is not None:
+                    mms['__sender_address'] = sender
+                mms['__recipient_addresses'] = [r for r in rows if r is not sender]
+                mms['__parts'] = parts
+                yield 'mms', mms
+                mms = None
+                root.clear()
+            elif tag == 'sms' and mms is None:
+                root.clear()
+
+
+def xml_root(f):
+    """The name of an XML document's root element, or None if it is not XML."""
+    try:
+        for _, el in ET.iterparse(f, events=('start',)):
+            return el.tag
+    except ET.ParseError:
+        return None
+    return None
+
+
+class XmlSource:
+    """A backup kept in XML: SMS Backup & Restore (a .xml file, or one inside a ZIP),
+    Wonder (a ZIP with one XML file and mms_attachments/) or Pom (a ZIP with sms.xml and
+    mms.xml)."""
+
+    unit = 'record'
+
+    def __init__(self, path, fmt, zf=None, members=(), workdir=None):
+        self.path, self.format, self.zip, self.members = os.path.abspath(path), fmt, zf, list(members)
+        self.kind = 'zip' if zf else 'file'
+        self.store = AttachmentStore(workdir)
+        self.files = {}
+        self.describe = {
+            'sbr': 'SMS Backup & Restore XML backup (attachments inside, as base64)',
+            'wonder': 'Wonder ZIP backup: an XML file + mms_attachments/',
+            'pom': 'Pom ZIP backup: sms.xml + mms.xml (attachments inside, as base64)'}[fmt]
+        if fmt == 'wonder' and zf:
+            for n in zf.namelist():
+                if n.startswith('mms_attachments/') and not n.endswith('/'):
+                    self.files.setdefault(n.rsplit('/', 1)[-1], n)
+        self.names = set(self.files)
+
+    def open(self, member):
+        return self.zip.open(member) if self.zip else open(self.path, 'rb')
+
+    def load(self):
+        msgs, record = [], 0
+        try:
+            for member in self.members or [None]:
+                flavor = self.format
+                with self.open(member) as f:
+                    for kind, o in xml_records(f, flavor, self.store):
+                        record += 1
+                        msgs.append(Msg(record, kind, o))
+        except ET.ParseError as e:
+            sys.exit('error: the backup\'s XML is damaged (%s)' % e)
+        if self.format != 'wonder':
+            self.names = set(self.store.sizes)
+        return msgs, [], 0
+
+    def read_part(self, name):
+        if name in self.files:
+            with self.zip.open(self.files[name]) as f:
+                return f.read()
+        return self.store.read(name)
+
+    def part_size(self, name):
+        if name in self.files:
+            return self.zip.getinfo(self.files[name]).file_size
+        return self.store.sizes[name]
+
+    def close(self):
+        self.store.close()
+
+
+class BuggySource:
+    """A Buggy Backup ZIP: conversations/conv_<n>, each one SMS as JSON with one-letter
+    keys (see BUGGY_KEYS). It holds no MMS."""
+
+    format = 'buggy'
+    describe = 'Buggy Backup ZIP: conversations/conv_N (SMS only)'
+    unit = 'record'
+    kind = 'zip'
+    names = set()
+
+    def __init__(self, path, zf):
+        self.path, self.zip = os.path.abspath(path), zf
+        entries = [(int(m.group(1)), n) for n in zf.namelist() for m in [re.fullmatch('conversations/conv_([0-9]+)', n)] if m]
+        self.entries = [n for _, n in sorted(entries)]
+
+    def load(self):
+        msgs, bad = [], []
+        for record, name in enumerate(self.entries, 1):
+            try:
+                obj = json.loads(self.zip.read(name).decode('utf-8'))
+            except (UnicodeDecodeError, ValueError) as e:
+                bad.append((record, 'unreadable entry %s: %s' % (name, e)))
+                continue
+            if not isinstance(obj, dict):
+                bad.append((record, 'entry %s is not a JSON object' % name))
+                continue
+            o = {col: obj[key] for key, col in BUGGY_KEYS if key in obj}
+            if classify(o):
+                msgs.append(Msg(record, 'sms', o))
+            else:
+                bad.append((record, 'entry %s has neither an address nor a text' % name))
+        return msgs, bad, 0
+
+    def read_part(self, name):
+        raise KeyError(name)
+
+    def part_size(self, name):
+        raise KeyError(name)
+
+    def close(self):
+        pass
+
+
+def open_source(path, workdir=None):
+    """Detects the backup's format from its contents and opens it."""
+    if os.path.isdir(path):
+        return SieSource(path)
+    if not os.path.isfile(path):
+        sys.exit('error: %s not found' % path)
+    if zipfile.is_zipfile(path):
+        zf = zipfile.ZipFile(path)
+        names = zf.namelist()
+        if any(n.rsplit('/', 1)[-1] == 'messages.ndjson' for n in names):
+            return SieSource(path, zf)
+        if any(re.fullmatch('conversations/conv_[0-9]+', n) for n in names):
+            return BuggySource(path, zf)
+        if any(n in ('sms.xml', 'mms.xml', '_pom_backup_manifest.json') for n in names):
+            return XmlSource(path, 'pom', zf, [n for n in ('sms.xml', 'mms.xml') if n in names], workdir)
+        tops = [n for n in names if '/' not in n and n.lower().endswith('.xml')]
+        if tops:
+            with zf.open(tops[0]) as f:
+                root = xml_root(f)
+            if root == 'smses':
+                return XmlSource(path, 'sbr', zf, tops[:1], workdir)
+            if root == 'messages':
+                return XmlSource(path, 'wonder', zf, tops[:1], workdir)
+        sys.exit('error: %s is a ZIP file, but not a backup this converter knows (Fig/TAK, SMS Backup & '
+                 'Restore, Wonder, Pom or Buggy Backup)' % path)
+    with open(path, 'rb') as f:
+        root = xml_root(f)
+    if root == 'smses':
+        return XmlSource(path, 'sbr', workdir=workdir)
+    if root == 'messages':
+        return XmlSource(path, 'wonder', workdir=workdir)
+    if root == 'calls':
+        sys.exit('error: %s is a call log backup, not a message backup' % path)
+    sys.exit('error: %s is not a message backup this converter knows (Fig/TAK, SMS Backup & Restore, '
+             'Wonder, Pom or Buggy Backup)' % path)
+
 
 class Msg:
-    """One source record: its line number in messages.ndjson, 'sms' or 'mms', the JSON object."""
+    """One source record: its line number in messages.ndjson (its position, for other
+    formats), 'sms' or 'mms', and its columns."""
 
     __slots__ = ('line', 'kind', 'o')
 
@@ -153,25 +469,7 @@ class Msg:
 
 
 def load(src):
-    msgs, bad, blank = [], [], 0
-    for number, raw in src.lines():
-        if not raw.strip():
-            blank += 1
-            continue
-        try:
-            o = json.loads(raw.decode('utf-8'))
-        except (UnicodeDecodeError, ValueError) as e:
-            bad.append((number, 'unreadable line: %s' % e))
-            continue
-        if not isinstance(o, dict):
-            bad.append((number, 'line is not a JSON object'))
-        elif pick(o, K_PARTS) is not None or 'msg_box' in o or 'm_type' in o:
-            msgs.append(Msg(number, 'mms', o))
-        elif 'body' in o or 'address' in o:
-            msgs.append(Msg(number, 'sms', o))
-        else:
-            bad.append((number, 'neither an SMS nor an MMS record'))
-    return msgs, bad, blank
+    return src.load()
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -191,6 +489,11 @@ def sval(o, key):
     if isinstance(v, bool):
         return '1' if v else '0'
     return v if isinstance(v, str) else str(v)
+
+
+def nstr(s):
+    """A value for a message text: None as "null", as JavaScript and Kotlin print it."""
+    return 'null' if s is None else s
 
 
 def is_int(s):
@@ -296,6 +599,21 @@ def sub_id_for(o, policy):
 
 def clean(s, mode):
     return XML_ILLEGAL.sub('' if mode == 'strip' else '�', s) if s else s
+
+
+def is_pdf(p):
+    return (sval(p, 'ct') or '').split(';')[0].strip().lower() == 'application/pdf'
+
+
+def written_parts(o, args):
+    """The MMS parts that are written: all of them, or all but PDF files with --no-pdf."""
+    parts = mms_parts(o)
+    return [p for p in parts if not is_pdf(p)] if args.no_pdf else parts
+
+
+def u8len(s):
+    """The UTF-8 size of a text; an unpaired surrogate counts as 3 bytes."""
+    return len(s.encode('utf-8', 'surrogatepass')) if s else 0
 
 
 # ----------------------------------------------------------------------------- planning
@@ -411,14 +729,15 @@ class Plan:
         return None
 
 
-def pick_sample(msgs, plan):
-    """A small, representative test set: one one-to-one conversation (SMS both ways, MMS
-    with attachments both ways, a text-only MMS, SMS with line breaks / emoji / XML
-    special characters) and the largest group conversation (received with and without
-    attachments, sent)."""
+def pick_sample(msgs, plan, by_chat=False):
+    """A small, representative test set: the one-to-one conversation with the most kinds of
+    message (SMS both ways, MMS with attachments both ways, a text-only MMS, SMS with line
+    breaks / emoji / XML special characters) and the largest group conversation (received
+    with and without attachments, sent). Conversations are the old thread_id values, or, for formats that
+    have none (by_chat), the participants."""
     by_thread = collections.defaultdict(list)
     for m in msgs:
-        by_thread[sval(m.o, 'thread_id')].append(m)
+        by_thread[chat_key(plan, m) if by_chat else sval(m.o, 'thread_id')].append(m)
 
     def media(m):
         return m.kind == 'mms' and any(part_file(p) for p in mms_parts(m.o))
@@ -433,7 +752,7 @@ def pick_sample(msgs, plan):
     for t, ms in by_thread.items():
         sms = [m for m in ms if m.kind == 'sms']
         mms = [m for m in ms if m.kind == 'mms']
-        if t is None or not sms or not mms or any(group(m) for m in mms):
+        if t is None or any(group(m) for m in mms):
             continue
         score = (sum(any(media(m) and sval(m.o, 'msg_box') == b for m in mms) for b in '12'),
                  len({sval(m.o, 'type') for m in sms}), len(ms))
@@ -530,7 +849,7 @@ class Converter:
             if v is not None:
                 attrs.append((k, v))
         out = [self.tag('  ', 'mms', attrs, m, end='>'), '    <parts>\n']
-        for p in mms_parts(o):
+        for p in written_parts(o, self.args):
             line = self.tag('      ', 'part', [(k, sval(p, k) if sval(p, k) is not None else 'null')
                                                for k in PART_ATTRS], m, 'part.', end='')
             name = part_file(p)
@@ -543,11 +862,11 @@ class Converter:
                     if not data:
                         self.stats['attachments_empty'] += 1
                         self.notes[m.line].append('attachment %s (%s) is an empty (0-byte) file in the '
-                                                  'export' % (name, sval(p, 'ct')))
+                                                  'export' % (name, nstr(sval(p, 'ct'))))
                 else:
                     self.stats['attachments_missing'] += 1
                     self.notes[m.line].append('attachment file %s (%s) is not in the export; part written '
-                                              'without data' % (name, sval(p, 'ct')))
+                                              'without data' % (name, nstr(sval(p, 'ct'))))
             out.append(line[:-1] + ' />\n')
         out.append('    </parts>\n    <addrs>\n')
         for r in mms_addr_rows(o):
@@ -557,74 +876,490 @@ class Converter:
         return ''.join(out)
 
 
-def guard_output(src, out, force):
+def guard_output(src, out, force, target):
     out = os.path.abspath(out)
     if out == src.path or (src.kind == 'folder' and (
             out == src.ndjson or out.startswith(os.path.join(src.path, 'data') + os.sep))):
-        sys.exit('error: refusing to write into the source export')
-    if not out.lower().endswith('.xml'):
-        sys.exit('error: the output file name must end in .xml (SMS Backup & Restore lists sms-*.xml)')
+        sys.exit('error: refusing to write into the source backup')
+    ext = '.xml' if target == 'sbr' else '.zip'
+    if not out.lower().endswith(ext):
+        sys.exit('error: the output file name must end in %s%s' % (
+            ext, ' (SMS Backup & Restore lists sms-*.xml)' if target == 'sbr' else ''))
     if os.path.exists(out) and not force:
         sys.exit('error: %s already exists (use --force to replace it)' % out)
 
 
-def cmd_convert(args):
-    src = Source(args.source)
-    guard_output(src, args.output, args.force)
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    msgs, bad, blank = load(src)
-    plan = Plan(msgs, args.owner)
-    conv = Converter(src, plan, args)
+# ----------------------------------------------------------------------------- choosing
+
+def choose(src, msgs, plan, args):
+    """Splits the records into problems and convertible ones, applies the "what to keep"
+    options, and picks the test sample. Returns (problems, ok, chosen, left_out) where
+    left_out counts the records each option left out."""
     problems = [(m, plan.problem(m)) for m in msgs if plan.problem(m)]
     ok = [m for m in msgs if not plan.problem(m)]
-    chosen = pick_sample(ok, plan) if args.sample else ok
+    kept, left_out = [], collections.Counter()
+    for m in ok:
+        if args.keep == 'sms' and m.kind != 'sms':
+            left_out['mms'] += 1
+        elif args.keep == 'mms' and m.kind != 'mms':
+            left_out['sms'] += 1
+        elif args.no_groups and m.kind == 'mms' and len(plan.address_list(m)) > 1:
+            left_out['groups'] += 1
+        else:
+            kept.append(m)
+    chosen = pick_sample(kept, plan, src.format != 'sie') if args.sample else kept
+    if args.no_pdf:
+        left_out['pdf'] = sum(1 for m in chosen if m.kind == 'mms' for p in mms_parts(m.o) if is_pdf(p))
+    return problems, ok, chosen, left_out
 
-    now = dt.datetime.now().astimezone()
-    tmp = args.output + '.partial'
+
+def chat_key(plan, m):
+    """The conversation a message is restored into: its participants, without the owner."""
+    if m.kind == 'sms':
+        return addr_key(sval(m.o, 'address'))
+    return ','.join(sorted({addr_key(a) for a in plan.address_list(m)}))
+
+
+def estimate(m, src, args):
+    """About how many bytes the message takes in the output (attachments exactly)."""
+    o = m.o
+    if m.kind == 'sms':
+        return 200 + u8len(sval(o, 'body')) + u8len(sval(o, 'address'))
+    n = 1000 + 100 * len(mms_addr_rows(o))
+    for p in written_parts(o, args):
+        n += 200 + u8len(sval(p, 'text'))
+        name = part_file(p)
+        if name and name in src.names:
+            size = src.part_size(name)
+            n += 4 * ((size + 2) // 3) if args.to == 'sbr' else size
+    return n
+
+
+def split_messages(chosen, src, plan, args):
+    """The messages of each output file. With --split-mb, a conversation goes into one file
+    whenever it fits, a message is never split, and files hold their messages in the
+    original order; restored one after another, they give back every message."""
+    limit = int(args.split_mb * 1048576)
+    if limit <= 0:
+        return [chosen]
+    chats = collections.OrderedDict()
+    for m in chosen:
+        chats.setdefault(chat_key(plan, m), []).append(m)
+    parts, cur, size = [], [], 0
+    for ms in chats.values():
+        sizes = [estimate(m, src, args) for m in ms]
+        if cur and size + sum(sizes) > limit:
+            parts.append(cur)
+            cur, size = [], 0
+        for m, n in zip(ms, sizes):
+            if cur and size + n > limit:
+                parts.append(cur)
+                cur, size = [], 0
+            cur.append(m)
+            size += n
+    if cur:
+        parts.append(cur)
+    index = {id(m): i for i, m in enumerate(chosen)}
+    return [sorted(p, key=lambda m: index[id(m)]) for p in parts]
+
+
+# ----------------------------------------------------------------------------- writing
+
+class ZipWriter:
+    """Writes a ZIP archive of stored (uncompressed) entries with their sizes in the
+    local headers and no data descriptors, which every importer accepts (Fig's rejects
+    some other ZIP layouts); ZIP64 records only when an archive needs them."""
+
+    def __init__(self, f, when):
+        self.f, self.offset, self.entries = f, 0, []
+        year = min(max(when.year, 1980), 2107)
+        self.time = (when.hour << 11) | (when.minute << 5) | (when.second // 2)
+        self.date = ((year - 1980) << 9) | (when.month << 5) | when.day
+
+    def add(self, name, data):
+        nb = name.encode('utf-8')
+        crc, size = zlib.crc32(data) & 0xffffffff, len(data)
+        big = size >= 0xffffffff or self.offset >= 0xffffffff
+        extra = struct.pack('<HHQQ', 1, 16, size, size) if big else b''
+        self.f.write(struct.pack('<IHHHHHIIIHH', 0x04034b50, 45 if big else 20, 0x0800, 0, self.time, self.date,
+                                 crc, 0xffffffff if big else size, 0xffffffff if big else size, len(nb), len(extra)))
+        self.f.write(nb + extra)
+        self.f.write(data)
+        self.entries.append((nb, crc, size, self.offset))
+        self.offset += 30 + len(nb) + len(extra) + size
+
+    def close(self):
+        start, cd = self.offset, []
+        for nb, crc, size, off in self.entries:
+            big = size >= 0xffffffff or off >= 0xffffffff
+            extra = struct.pack('<HHQQQ', 1, 24, size, size, off) if big else b''
+            cd.append(struct.pack('<IHHHHHHIIIHHHHHII', 0x02014b50, 45 if big else 20, 45 if big else 20, 0x0800, 0,
+                                  self.time, self.date, crc, 0xffffffff if big else size,
+                                  0xffffffff if big else size, len(nb), len(extra), 0, 0, 0, 0,
+                                  0xffffffff if big else off) + nb + extra)
+        cd = b''.join(cd)
+        self.f.write(cd)
+        n, end = len(self.entries), start + len(cd)
+        if n >= 0xffff or start >= 0xffffffff or len(cd) >= 0xffffffff:
+            self.f.write(struct.pack('<IQHHIIQQQQ', 0x06064b50, 44, 45, 45, 0, 0, n, n, len(cd), start))
+            self.f.write(struct.pack('<IIQI', 0x07064b50, 0, end, 1))
+            self.f.write(struct.pack('<IHHHHIIH', 0x06054b50, 0, 0, 0xffff, 0xffff, 0xffffffff, 0xffffffff, 0))
+        else:
+            self.f.write(struct.pack('<IHHHHIIH', 0x06054b50, 0, 0, n, n, len(cd), start, 0))
+
+
+def jstr(s):
+    """A JSON string exactly as JavaScript's JSON.stringify writes it."""
+    return '"' + JSON_ESCAPE_RE.sub(lambda m: JSON_ESCAPES.get(m.group()) or '\\u%04x' % ord(m.group()), s) + '"'
+
+
+JSON_ESCAPES = {'"': '\\"', '\\': '\\\\', '\b': '\\b', '\f': '\\f', '\n': '\\n', '\r': '\\r', '\t': '\\t'}
+JSON_ESCAPE_RE = re.compile('["\\\\\x00-\x1f\ud800-\udfff]')
+
+
+def jdump(v):
+    """JSON text exactly as JavaScript's JSON.stringify writes it (no spaces)."""
+    if v is None:
+        return 'null'
+    if v is True:
+        return 'true'
+    if v is False:
+        return 'false'
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return json.dumps(v)
+    if isinstance(v, str):
+        return jstr(v)
+    if isinstance(v, list):
+        return '[' + ','.join(jdump(x) for x in v) + ']'
+    return '{' + ','.join(jstr(k) + ':' + jdump(x) for k, x in v.items()) + '}'
+
+
+def attachment_note(conv, m, p, name, present, size):
+    """Counts an attachment and notes an empty or missing one (the same for every format)."""
+    conv.stats['attachments'] += 1
+    if not present:
+        conv.stats['attachments_missing'] += 1
+        conv.notes[m.line].append('attachment file %s (%s) is not in the export; part written without data'
+                                  % (name, nstr(sval(p, 'ct'))))
+    else:
+        conv.stats['attachment_bytes'] += size
+        if not size:
+            conv.stats['attachments_empty'] += 1
+            conv.notes[m.line].append('attachment %s (%s) is an empty (0-byte) file in the export'
+                                      % (name, nstr(sval(p, 'ct'))))
+
+
+def fig_ids(chosen, plan):
+    """Row and thread ids for records that come from another format (Fig's importer, SMS
+    Import / Export, expects them): numbered in the order written, threads by participants."""
+    ids, threads = {}, {}
+    for i, m in enumerate(chosen, 1):
+        key = chat_key(plan, m)
+        threads.setdefault(key, str(len(threads) + 1))
+        ids[id(m)] = (str(i), threads[key])
+    return ids
+
+
+def fig_part(msgs, src, plan, args, conv, ids):
+    """messages.ndjson and its data/ files for one output file, as SMS Import / Export
+    writes them. Records from an SMS Import / Export export are written back unchanged
+    except for the options (SIM id, PDFs)."""
+    lines, files, seen, k = [], [], set(), 0
+    for m in msgs:
+        o = m.o
+        if src.format == 'sie':
+            obj = json.loads(json.dumps(o))
+            key = next((x for x in K_PARTS if isinstance(obj.get(x), list)), None)
+            if m.kind == 'mms' and args.no_pdf and key:
+                obj[key] = [p for p in obj[key] if not (isinstance(p, dict) and is_pdf(p))]
+        else:
+            rid, tid = ids[id(m)]
+            obj = {'_id': rid, 'thread_id': tid}
+            for key, v in o.items():
+                if key not in ('_id', 'thread_id', '__sender_address', '__recipient_addresses', '__parts'):
+                    obj[key] = v
+            if args.sub_id != 'keep':
+                obj['sub_id'] = sub_id_for(o, args.sub_id)
+            if m.kind == 'mms':
+                d = sval(o, 'date')
+                if is_int(d) and int(d) >= 10 ** 11:
+                    obj['date'] = str(int(d) // 1000)
+                sender = o.get('__sender_address')
+                if isinstance(sender, dict):
+                    obj['__sender_address'] = dict(sender, msg_id=rid)
+                obj['__recipient_addresses'] = [dict(r, msg_id=rid) for r in o.get('__recipient_addresses') or []
+                                                if isinstance(r, dict)]
+                obj['__parts'] = [dict(p, mid=rid) for p in written_parts(o, args)]
+        if src.format == 'sie' and args.sub_id != 'keep':
+            obj['sub_id'] = sub_id_for(o, args.sub_id)
+        if m.kind == 'mms':
+            parts = pick(obj, K_PARTS)
+            for p in (parts if isinstance(parts, list) else []):
+                if not isinstance(p, dict):
+                    continue
+                name = part_file(p)
+                if not name:
+                    continue
+                present = name in src.names
+                attachment_note(conv, m, p, name, present, src.part_size(name) if present else 0)
+                if src.format == 'sie':
+                    if present and name not in seen:
+                        seen.add(name)
+                        files.append(('data/' + name, name))
+                elif present:
+                    k += 1
+                    p['_data'] = APP_PARTS + 'PART_%d' % k
+                    files.append(('data/PART_%d' % k, name))
+                else:
+                    del p['_data']
+        lines.append(jdump(obj))
+    return ('\n'.join(lines) + '\n').encode('utf-8', 'surrogatepass'), files
+
+
+def ext_for(ct, label):
+    base = (ct or '').split(';')[0].strip().lower()
+    if base in EXTENSIONS:
+        return EXTENSIONS[base]
+    m = re.search('\\.([A-Za-z0-9]{1,5})$', label or '')
+    return m.group(1).lower() if m else 'bin'
+
+
+def wonder_smil(refs):
+    body = ''.join('<par dur="5000ms"><%s src="%s" region="Image"/></par>' % (
+        'img' if ct.startswith('image/') else 'video' if ct.startswith('video/') else
+        'audio' if ct.startswith('audio/') else 'ref', esc(label)) for ct, label in refs)
+    return ('<smil><head><layout><root-layout/><region id="Image" fit="meet" top="0" left="0" height="100%" '
+            'width="100%"/></layout></head><body>' + body + '</body></smil>')
+
+
+def wonder_part(msgs, src, args, conv):
+    """The XML file and mms_attachments/ files of a Wonder backup."""
+    out = ['<?xml version="1.0" encoding="UTF-8"?>\n<messages sms_count="%d" mms_count="%d">\n' % (
+        sum(m.kind == 'sms' for m in msgs), sum(m.kind == 'mms' for m in msgs))]
+    files, n_mms, k = [], 0, 0
+    for m in msgs:
+        o = m.o
+        if m.kind == 'sms':
+            out.append(conv.tag('  ', 'sms', [
+                ('address', sval(o, 'address') or ''), ('body', sval(o, 'body') or ''), ('date', sval(o, 'date')),
+                ('date_sent', sval(o, 'date_sent') or '0'), ('type', sval(o, 'type')),
+                ('read', sval(o, 'read') or '1'), ('seen', sval(o, 'seen') or '1')], m))
+            continue
+        n_mms += 1
+        box = sval(o, 'msg_box')
+        out.append(conv.tag('  ', 'mms', [
+            ('date', str(m.date_ms // 1000)), ('read', sval(o, 'read') or '1'), ('msg_box', box),
+            ('ct_t', sval(o, 'ct_t') or 'application/vnd.wap.multipart.related'),
+            ('m_type', sval(o, 'm_type') or ('132' if box == '1' else '128')), ('seen', sval(o, 'seen') or '1')],
+            m, end='>'))
+        for r in mms_addr_rows(o):
+            out.append(conv.tag('    ', 'addr', [('address', sval(r, 'address') or ''),
+                                                 ('type', sval(r, 'type') or '151')], m, 'addr.'))
+        parts, refs = [], []
+        ps = written_parts(o, args)
+        for p in ps:
+            ct = sval(p, 'ct') or 'application/octet-stream'
+            label = sval(p, 'cl') or sval(p, 'name')
+            name = part_file(p)
+            present = bool(name) and name in src.names
+            if name:
+                attachment_note(conv, m, p, name, present, src.part_size(name) if present else 0)
+            if present:
+                k += 1
+                fn = 'mms_%d_%d.%s' % (n_mms, k, ext_for(ct, label))
+                label = label or fn
+                parts.append(conv.tag('    ', 'part', [('ct', ct), ('name', label), ('cl', label), ('file', fn)],
+                                      m, 'part.'))
+                files.append(('mms_attachments/' + fn, name))
+                refs.append((ct, label))
+            else:
+                attrs = [('ct', sval(p, 'ct') or 'text/plain')]
+                if label:
+                    attrs += [('name', label), ('cl', label)]
+                if sval(p, 'text') is not None:
+                    attrs.append(('text', sval(p, 'text')))
+                parts.append(conv.tag('    ', 'part', attrs, m, 'part.'))
+        if refs and not any(sval(p, 'ct') == 'application/smil' for p in ps):
+            parts.insert(0, conv.tag('    ', 'part', [('ct', 'application/smil'), ('name', 'smil.xml'),
+                                                     ('cl', 'smil.xml'), ('text', wonder_smil(refs))], m, 'part.'))
+        out += parts
+        out.append('  </mms>\n')
+    out.append('</messages>\n')
+    return ''.join(out).encode('utf-8'), files
+
+
+def write_zip(path, entries, src, now):
+    """entries: [(entry name, bytes or the name of a source attachment)]."""
+    with open(path, 'wb') as f:
+        z = ZipWriter(f, now)
+        for name, data in entries:
+            z.add(name, data if isinstance(data, bytes) else src.read_part(data))
+        z.close()
+
+
+def verify_zip(path, target, first, files, msgs, src):
+    """Re-reads a written ZIP: every entry's CRC-32, the message file byte for byte, every
+    attachment by SHA-256, and the messages read back with this converter's own reader."""
+    errors, checked = [], 0
+    try:
+        with zipfile.ZipFile(path) as z:
+            bad = z.testzip()
+            if bad:
+                errors.append('entry %s is damaged (CRC-32 mismatch)' % bad)
+            names = z.namelist()
+            want = [first[0]] + [n for n, _ in files]
+            if names != want:
+                errors.append('the ZIP holds %d entries, expected %d' % (len(names), len(want)))
+            elif z.read(first[0]) != first[1]:
+                errors.append('%s differs from what was written' % first[0])
+            else:
+                hashes = {}
+                for entry, name in files:
+                    if name not in hashes:
+                        hashes[name] = hashlib.sha256(src.read_part(name)).hexdigest()
+                    if hashlib.sha256(z.read(entry)).hexdigest() != hashes[name]:
+                        errors.append('attachment %s differs from the source file %s' % (entry, name))
+                    else:
+                        checked += 1
+    except zipfile.BadZipFile as e:
+        errors.append('not a readable ZIP file: %s' % e)
+    back = collections.Counter()
+    if not errors:
+        rsrc = open_source(path)
+        try:
+            rmsgs, rbad, _ = rsrc.load()
+            back = collections.Counter(m.kind for m in rmsgs)
+            if rbad:
+                errors.append('%d record(s) could not be read back' % len(rbad))
+        finally:
+            rsrc.close()
+    want = collections.Counter(m.kind for m in msgs)
+    if not errors and back != want:
+        errors.append('read back %d SMS + %d MMS, expected %d SMS + %d MMS' % (
+            back['sms'], back['mms'], want['sms'], want['mms']))
+    return [
+        'VERIFICATION (the saved ZIP re-read: every entry\'s CRC-32, the %s byte for byte, every attachment' % (
+            'message file' if target == 'fig' else 'XML file'),
+        '              by SHA-256, and the messages read back with this converter\'s %s reader)' % TARGET_NAMES[target],
+        '  messages read back:       %d SMS + %d MMS (written %d SMS + %d MMS)' % (
+            back['sms'], back['mms'], want['sms'], want['mms']),
+        '  attachments checked:      %d' % checked,
+        '  result: %s' % ('PASSED' if not errors else 'FAILED')] + ['    ! ' + e for e in errors], (1 if errors else 0)
+
+
+def write_sbr(path, msgs, conv, args, now):
+    tmp = path + '.partial'
     with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
         f.write("<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>\n")
-        f.write('<!--Converted from an SMS Import / Export backup by sie_to_sbr.py %s on %s. '
-                'readable_date values are in %s.-->\n' % (VERSION, now.strftime('%Y-%m-%d %H:%M:%S %z'),
-                                                          tz_label(args.tz)))
+        f.write('<!--Converted by sie_to_sbr.py %s on %s. readable_date values are in %s.-->\n'
+                % (VERSION, now.strftime('%Y-%m-%d %H:%M:%S %z'), tz_label(args.tz)))
         f.write('<?xml-stylesheet type="text/xsl" href="sms.xsl"?>\n')
         f.write('<smses count="%d" backup_set="%s" backup_date="%d" type="full">\n'
-                % (len(chosen), uuid.uuid4(), int(now.timestamp() * 1000)))
-        for m in chosen:
+                % (len(msgs), uuid.uuid4(), int(now.timestamp() * 1000)))
+        for m in msgs:
             f.write(conv.sms(m) if m.kind == 'sms' else conv.mms(m))
         f.write('</smses>\n')
-    os.replace(tmp, args.output)
+    os.replace(tmp, path)
 
-    manifest = args.output[:-4] + '.manifest.csv'
-    with open(manifest, 'w', encoding='utf-8', newline='') as f:
+
+def write_manifest(path, msgs, plan, conv, args):
+    with open(path, 'w', encoding='utf-8', newline='') as f:
         w = csv.writer(f)
         w.writerow(['xml_index', 'kind', 'direction', 'source_line', 'source_id', 'source_thread_id',
                     'source_sub_id', 'written_sub_id', 'date_ms', 'date_utc', 'address_written',
                     'parts', 'attachments', 'notes'])
-        for i, m in enumerate(chosen, 1):
+        for i, m in enumerate(msgs, 1):
             o = m.o
+            parts = written_parts(o, args) if m.kind == 'mms' else []
             addr = sval(o, 'address') if m.kind == 'sms' else '~'.join(plan.address_list(m))
             w.writerow([i, m.kind, m.direction, m.line, sval(o, '_id'), sval(o, 'thread_id'),
                         sval(o, 'sub_id'), sub_id_for(o, args.sub_id), m.date_ms, utc(m.date_ms),
-                        addr, len(mms_parts(o)) if m.kind == 'mms' else '',
-                        sum(1 for p in mms_parts(o) if part_file(p)) if m.kind == 'mms' else '',
+                        addr, len(parts) if m.kind == 'mms' else '',
+                        sum(1 for p in parts if part_file(p)) if m.kind == 'mms' else '',
                         '; '.join(conv.notes.get(m.line, []))])
 
-    report = []
-    report += source_summary(src, msgs, bad, blank, plan)
+
+def describe_filters(args, left_out):
+    out = []
+    if args.keep == 'sms':
+        out.append('text messages (SMS) only, %d MMS left out' % left_out['mms'])
+    elif args.keep == 'mms':
+        out.append('picture and group messages (MMS) only, %d SMS left out' % left_out['sms'])
+    if args.no_groups:
+        out.append('%d group MMS left out' % left_out['groups'])
+    if args.no_pdf:
+        out.append('%d PDF attachment(s) left out' % left_out['pdf'])
+    return '; '.join(out) or 'none (everything is kept)'
+
+
+def cmd_convert(args):
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+    os.makedirs(out_dir, exist_ok=True)
+    src = open_source(args.source, out_dir)
+    try:
+        return convert_with(src, args)
+    finally:
+        src.close()
+
+
+def convert_with(src, args):
+    guard_output(src, args.output, args.force, args.to)
+    msgs, bad, blank = load(src)
+    plan = Plan(msgs, args.owner)
+    conv = Converter(src, plan, args)
+    problems, ok, chosen, left_out = choose(src, msgs, plan, args)
+    groups = split_messages(chosen, src, plan, args)
+    stem, ext = os.path.splitext(args.output)
+    paths = [args.output] if len(groups) == 1 else ['%s-part%d%s' % (stem, k, ext) for k in range(1, len(groups) + 1)]
+    now = dt.datetime.now().astimezone()
+    ids = fig_ids(chosen, plan) if args.to == 'fig' else None
+    vreport, status, written = [], 0, []
+    for k, (path, part) in enumerate(zip(paths, groups), 1):
+        if os.path.exists(path) and not args.force:
+            sys.exit('error: %s already exists (use --force to replace it)' % path)
+        if args.to == 'sbr':
+            write_sbr(path, part, conv, args, now)
+            lines, st = verify(src, part, plan, args, path)
+        else:
+            if args.to == 'fig':
+                data, files = fig_part(part, src, plan, args, conv, ids)
+                first = ('messages.ndjson', data)
+            else:
+                data, files = wonder_part(part, src, args, conv)
+                first = ('Messages_Backup_%s.xml' % now.strftime('%Y-%m-%d'), data)
+            write_zip(path + '.partial', [first] + files, src, now)
+            os.replace(path + '.partial', path)
+            lines, st = verify_zip(path, args.to, first, files, part, src)
+        write_manifest(path[:-4] + '.manifest.csv', part, plan, conv, args)
+        if len(groups) > 1:
+            lines = ['PART %d of %d: %s (%d messages)' % (k, len(groups), os.path.basename(path), len(part))] + lines
+        vreport += lines + ['']
+        status = status or st
+        written.append(path)
+
+    report = source_summary(src, msgs, bad, blank, plan)
     report += ['', 'CONVERSION',
-               '  output:            %s (%s bytes)' % (os.path.abspath(args.output), format(os.path.getsize(args.output), ',')),
-               '  mode:              %s' % ('test sample (--sample)' if args.sample else 'all messages'),
-               '  written:           %d SMS + %d MMS = %d messages (count="%d")' % (
-                   sum(m.kind == 'sms' for m in chosen), sum(m.kind == 'mms' for m in chosen), len(chosen), len(chosen)),
+               '  output format:     %s' % TARGET_NAMES[args.to]]
+    for path in written:
+        report.append('  output:            %s (%s bytes)' % (os.path.abspath(path), format(os.path.getsize(path), ',')))
+    if len(written) > 1:
+        report.append('  parts:             %d files of at most about %s MB; restore them in order, part 1 first'
+                      % (len(written), format(args.split_mb, 'g')))
+    report += ['  mode:              %s' % ('test sample (--sample)' if args.sample else 'all messages'),
+               '  kept:              %s' % describe_filters(args, left_out),
+               '  written:           %d SMS + %d MMS = %d messages' % (
+                   sum(m.kind == 'sms' for m in chosen), sum(m.kind == 'mms' for m in chosen), len(chosen)),
                '  attachments:       %d written (%s bytes), %d empty in the export, %d missing from the export' % (
                    conv.stats['attachments'] - conv.stats['attachments_missing'],
                    format(conv.stats['attachment_bytes'], ','), conv.stats['attachments_empty'],
                    conv.stats['attachments_missing']),
                '  not convertible:   %d record(s)%s' % (len(problems) + len(bad), '' if problems or bad else ' (none)')]
     for m, why in problems:
-        report.append('    line %d (%s): %s' % (m.line, m.kind, why))
+        report.append('    %s %d (%s): %s' % (src.unit, m.line, m.kind, why))
     for line, why in bad:
-        report.append('    line %d: %s' % (line, why))
+        report.append('    %s %d: %s' % (src.unit, line, why))
     report += ['  sub_id (SIM):      %s' % {
         'unknown': 'written as -1 ("SIM unknown") for every message; the old phone\'s values are in the manifest',
         'keep': 'the old phone\'s values written unchanged'}.get(args.sub_id, 'written as %s for every message' % args.sub_id),
@@ -632,28 +1367,37 @@ def cmd_convert(args):
                    len(conv.changes), 'removed' if args.nul == 'strip' else 'replaced by U+FFFD',
                    '' if conv.changes else ' - none')]
     for line, kind, field, n, chars in conv.changes:
-        report.append('    line %d (%s %s): %d x %s' % (line, kind, field, n, '/'.join(chars)))
-    report.append('  MMS whose "address" comes from their conversation (headers list fewer people): %d'
-                  % conv.stats['mms_address_from_conversation'])
-    for m in chosen:
-        if any(n.startswith('MMS headers') for n in conv.notes.get(m.line, [])):
-            report.append('    line %d (thread %s)' % (m.line, sval(m.o, 'thread_id')))
+        report.append('    %s %d (%s %s): %d x %s' % (src.unit, line, kind, field, n, '/'.join(chars)))
+    if args.to == 'sbr':
+        report.append('  MMS whose "address" comes from their conversation (headers list fewer people): %d'
+                      % conv.stats['mms_address_from_conversation'])
+        for m in chosen:
+            if any(n.startswith('MMS headers') for n in conv.notes.get(m.line, [])):
+                report.append('    %s %d (thread %s)' % (src.unit, m.line, sval(m.o, 'thread_id')))
     for m in chosen:
         for n in conv.notes.get(m.line, []):
             if 'attachment' in n:
-                report.append('    line %d: %s' % (m.line, n))
-    report += not_carried(chosen, args.sub_id)
+                report.append('    %s %d: %s' % (src.unit, m.line, n))
+    report += not_carried(chosen, args)
 
     print('\n'.join(report))
-    print('\nVerifying %s ...' % args.output)
-    vreport, status = verify(src, msgs, plan, args)
-    print('\n'.join(vreport))
-    with open(args.output[:-4] + '.report.txt', 'w', encoding='utf-8') as f:
-        f.write('SMS Import / Export -> SMS Backup & Restore conversion report (sie_to_sbr.py %s)\n' % VERSION)
+    print('\n' + '\n'.join(vreport).rstrip())
+    report_path = os.path.splitext(args.output)[0] + '.report.txt'
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write('Message backup conversion report (sie_to_sbr.py %s): %s -> %s\n' % (
+            VERSION, src.describe.split(':')[0], TARGET_NAMES[args.to]))
         f.write('generated %s\n\n' % now.strftime('%Y-%m-%d %H:%M:%S %z'))
-        f.write('\n'.join(report + [''] + vreport) + '\n')
-    print('\nwrote %s\n      %s\n      %s' % (args.output, manifest, args.output[:-4] + '.report.txt'))
+        f.write('\n'.join(report + [''] + vreport).rstrip() + '\n')
+    print('\nwrote %s\n      %s' % ('\n      '.join(written), report_path))
     return status
+
+
+def count_conversations(src, msgs, plan):
+    """Old conversations: thread_id values in an SMS Import / Export export; other formats
+    have none, so their messages are grouped by participants."""
+    if src.format == 'sie':
+        return '%d thread_id values' % len({sval(m.o, 'thread_id') for m in msgs})
+    return '%d (by participants)' % len({chat_key(plan, m) for m in msgs if not plan.problem(m)})
 
 
 def source_summary(src, msgs, bad, blank, plan):
@@ -662,25 +1406,23 @@ def source_summary(src, msgs, bad, blank, plan):
     parts = [p for m in mms for p in mms_parts(m.o)]
     refs = [part_file(p) for p in parts if part_file(p)]
     found = [r for r in refs if r in src.names]
-    if src.kind == 'folder':
-        empty = sum(1 for r in found if os.path.getsize(os.path.join(src.data_dir, r)) == 0)
-    else:
-        empty = sum(1 for r in found if src.zip.getinfo(src.members[r]).file_size == 0)
+    empty = sum(1 for r in found if src.part_size(r) == 0)
     dates = [m.date_ms for m in msgs if m.date_ms]
     count = lambda ms, f: ', '.join('%s %d' % (k, v) for k, v in sorted(collections.Counter(f(m) for m in ms).items()))
+    unit = 'lines' if src.unit == 'line' else 'records'
     return [
         'SOURCE',
         '  path:              %s (%s)' % (src.path, src.kind),
-        '  format:            SMS Import / Export (com.github.tmo1.sms_ie) export: messages.ndjson + data/',
-        '  records:           %d lines (%d blank, %d unreadable)' % (len(msgs) + len(bad) + blank, blank, len(bad)),
+        '  format:            %s' % src.describe,
+        '  records:           %d %s (%d blank, %d unreadable)' % (len(msgs) + len(bad) + blank, unit, blank, len(bad)),
         '  SMS:               %d (%s)' % (len(sms), count(sms, lambda m: m.direction)),
         '  MMS:               %d (%s)' % (len(mms), count(mms, lambda m: m.direction)),
         '  MMS parts:         %d (%s)' % (len(parts), count(parts, lambda p: 'SMIL' if sval(p, 'ct') == 'application/smil'
                                                                 else ('attachment' if part_file(p) else 'text'))),
-        '  attachment files:  %d referenced, %d present, %d missing, %d empty (0 bytes); %d file(s) in data/ '
+        '  attachment files:  %d referenced, %d present, %d missing, %d empty (0 bytes); %d file(s) '
         'not referenced by any part' % (len(refs), len(found), len(refs) - len(found), empty,
                                          len(src.names - set(refs))),
-        '  conversations:     %d thread_id values' % len({sval(m.o, 'thread_id') for m in msgs}),
+        '  conversations:     %s' % count_conversations(src, msgs, plan),
         '  owner number:      %s (from %s)' % (', '.join(mask(k) for k in sorted(plan.owner)) or 'unknown',
                                                plan.owner_how),
         '  dates:             %s .. %s' % (utc(min(dates), '%Y-%m-%d %H:%M UTC'), utc(max(dates), '%Y-%m-%d %H:%M UTC'))
@@ -689,23 +1431,34 @@ def source_summary(src, msgs, bad, blank, plan):
     ]
 
 
-def not_carried(msgs, sub_policy):
-    """Source fields with no place in SMS Backup & Restore's format (reported, not hidden)."""
-    known_sms = set(SMS_ORDER) | set(K_NAME)
-    known_mms = set(MMS_ORDER) | set(K_PARTS + K_SENDER + K_RECIPS + K_NAME)
+def not_carried(msgs, args):
+    """Source fields with no place in the target format (reported, not hidden)."""
+    sub_policy, target = args.sub_id, getattr(args, 'to', 'sbr')
+    if target == 'fig':
+        known_sms = known_mms = known_part = known_addr = None  # every column is kept
+    elif target == 'wonder':
+        known_sms = {'address', 'body', 'date', 'date_sent', 'type', 'read', 'seen'}
+        known_mms = {'date', 'read', 'msg_box', 'ct_t', 'm_type', 'seen'} | set(K_PARTS + K_SENDER + K_RECIPS)
+        known_part, known_addr = {'ct', 'name', 'cl', 'text', '_data'}, {'address', 'type'}
+    else:
+        known_sms = set(SMS_ORDER) | set(K_NAME)
+        known_mms = set(MMS_ORDER) | set(K_PARTS + K_SENDER + K_RECIPS + K_NAME)
+        known_part, known_addr = set(PART_ATTRS) | {'_data'}, set(ADDR_ATTRS) | set(K_NAME)
     c = collections.Counter()
     for m in msgs:
-        if m.kind == 'sms':
-            c.update('sms.' + k for k in m.o if k not in known_sms)
-        else:
-            c.update('mms.' + k for k in m.o if k not in known_mms)
-            for p in mms_parts(m.o):
-                c.update('part.' + k for k in p if k not in PART_ATTRS and k != '_data')
-            for r in mms_addr_rows(m.o):
-                c.update('addr.' + k for k in r if k not in ADDR_ATTRS and k not in K_NAME)
+        if known_sms is not None:
+            if m.kind == 'sms':
+                c.update('sms.' + k for k in m.o if k not in known_sms)
+            else:
+                c.update('mms.' + k for k in m.o if k not in known_mms)
+                for p in mms_parts(m.o):
+                    c.update('part.' + k for k in p if k not in known_part)
+                for r in mms_addr_rows(m.o):
+                    c.update('addr.' + k for k in r if k not in known_addr)
         if sub_policy != 'keep' and sval(m.o, 'sub_id') is not None:
             c['%s.sub_id (old phone value)' % m.kind] += 1
-    lines = ['  source fields not stored in the XML (no matching field in SMS Backup & Restore\'s format,',
+    lines = ['  source fields not stored in the %s (no matching field in its format,' % (
+             'XML' if target != 'fig' else 'ZIP'),
              '  or specific to the old phone; ids and sub_id are kept in the manifest):']
     lines += ['    %-34s %d' % (k, v) for k, v in sorted(c.items())] or ['    none']
     return lines
@@ -737,7 +1490,7 @@ def expected_mms(m, args, src, hashes):
     head = tuple(clean(sval(o, k), nul) if sval(o, k) is not None else (None if k in MMS_OMIT else 'null')
                  for k in MMS_COPIED)
     parts = []
-    for p in mms_parts(o):
+    for p in written_parts(o, args):
         vals = tuple(clean(sval(p, k), nul) if sval(p, k) is not None else 'null' for k in PART_ATTRS)
         name = part_file(p)
         if name and name in src.names:
@@ -771,18 +1524,18 @@ def actual_mms(el, errors):
     return ('mms', a.get('date'), a.get('sub_id')) + head + (tuple(parts), addrs)
 
 
-def verify(src, msgs, plan, args):
-    """Re-read the XML with a strict parser and match every element to its source record."""
+def verify(src, candidates, plan, args, path):
+    """Re-read the XML with a strict parser and match every element to the source record
+    it was written from; candidates are the messages the file is meant to hold."""
     tz = get_tz(args.tz)
     out, errors = [], []
     expected = collections.defaultdict(list)
     hashes = {}
-    candidates = [m for m in msgs if not plan.problem(m)]
     for m in candidates:
         key = expected_sms(m, args) if m.kind == 'sms' else expected_mms(m, args, src, hashes)
         expected[key].append(m)
 
-    with open(args.output, 'rb') as f:
+    with open(path, 'rb') as f:
         head = f.read(200)
     if not head.startswith(b"<?xml version='1.0' encoding='UTF-8'"):
         errors.append('the file does not start with the XML declaration SMS Backup & Restore writes')
@@ -791,7 +1544,7 @@ def verify(src, msgs, plan, args):
     bad_dates, bad_names, bad_tags = 0, 0, collections.Counter()
     root = None
     try:
-        for event, el in ET.iterparse(args.output, events=('start', 'end')):
+        for event, el in ET.iterparse(path, events=('start', 'end')):
             if event == 'start':
                 if root is None:
                     root, root_attrs = el, dict(el.attrib)
@@ -836,9 +1589,9 @@ def verify(src, msgs, plan, args):
         errors.append('%d message(s) in the XML do not match any source record exactly, e.g. %s'
                       % (len(unmatched), unmatched[:3]))
     left = [m for ms in expected.values() for m in ms]
-    if left and not args.sample:
-        errors.append('%d source message(s) are missing from the XML, e.g. lines %s'
-                      % (len(left), [m.line for m in left[:5]]))
+    if left:
+        errors.append('%d source message(s) are missing from the XML, e.g. %ss %s'
+                      % (len(left), src.unit, [m.line for m in left[:5]]))
     if bad_dates:
         errors.append('%d readable_date value(s) do not match their date' % bad_dates)
     if bad_names:
@@ -859,7 +1612,7 @@ def verify(src, msgs, plan, args):
     if mms_problems:
         errors.append('%d MMS have an address attribute that leaves out a participant or includes '
                       'the owner' % mms_problems)
-    split = {t: ks for t, ks in by_thread.items() if len(ks) > 1}
+    split = {t: ks for t, ks in by_thread.items() if len(ks) > 1 and t is not None}
     owners = collections.defaultdict(set)
     for t, ks in by_thread.items():
         for k in ks:
@@ -878,13 +1631,13 @@ def verify(src, msgs, plan, args):
             '    compared: addresses, bodies/texts, dates (MMS seconds x 1000), type/msg_box, read,',
             '    seen, status, every MMS header, every part (attachments by SHA-256), every addr row',
             '  attachments checked:      %d distinct files' % len(hashes),
-            '  conversations predicted after restore: %d (from %d old thread_id values)' % (
-                len(owners), len(by_thread))]
+            '  conversations predicted after restore: %d%s' % (
+                len(owners), ' (from %d old thread_id values)' % len(by_thread) if src.format == 'sie' else '')]
     for t, ks in sorted(split.items(), key=lambda x: str(x[0])):
         out.append('    old thread %s will appear as %d conversations: %s' % (
             t, len(ks), ' + '.join('[%s]' % ', '.join(mask(x) for x in sorted(k)) if len(k) < 4
                                    else '[%d people]' % len(k) for k in ks)))
-    for k, ts in merged.items():
+    for k, ts in merged.items() if src.format == 'sie' else ():
         out.append('    old threads %s will share one conversation [%s]' % (
             sorted(ts, key=str), ', '.join(mask(x) for x in sorted(k))))
     out.append('  result: %s' % ('PASSED' if not errors else 'FAILED'))
@@ -893,22 +1646,36 @@ def verify(src, msgs, plan, args):
 
 
 def cmd_verify(args):
-    src = Source(args.source)
-    msgs, bad, blank = load(src)
-    report, status = verify(src, msgs, Plan(msgs, args.owner), args)
-    print('\n'.join(report))
-    return status
+    """Checks an SMS Backup & Restore file made from SOURCE with the same options (by any
+    of the three versions of this converter)."""
+    if not args.output.lower().endswith('.xml'):
+        sys.exit('error: verify checks SMS Backup & Restore .xml files')
+    src = open_source(args.source)
+    try:
+        msgs, bad, blank = load(src)
+        plan = Plan(msgs, args.owner)
+        report, status = verify(src, choose(src, msgs, plan, args)[2], plan, args, args.output)
+        print('\n'.join(report))
+        return status
+    finally:
+        src.close()
 
 
 def cmd_analyze(args):
-    src = Source(args.source)
-    msgs, bad, blank = load(src)
-    plan = Plan(msgs, args.owner)
-    print('\n'.join(source_summary(src, msgs, bad, blank, plan) + not_carried(msgs, 'keep')))
-    for m in msgs:
-        if plan.problem(m):
-            print('  not convertible: line %d (%s): %s' % (m.line, m.kind, plan.problem(m)))
-    return 0
+    src = open_source(args.source)
+    try:
+        msgs, bad, blank = load(src)
+        plan = Plan(msgs, args.owner)
+        args.sub_id, args.to = 'keep', 'sbr'
+        print('\n'.join(source_summary(src, msgs, bad, blank, plan) + not_carried(msgs, args)))
+        for m in msgs:
+            if plan.problem(m):
+                print('  not convertible: %s %d (%s): %s' % (src.unit, m.line, m.kind, plan.problem(m)))
+        for line, why in bad:
+            print('  unreadable: %s %d: %s' % (src.unit, line, why))
+        return 0
+    finally:
+        src.close()
 
 
 def main():
@@ -916,11 +1683,17 @@ def main():
     sub = ap.add_subparsers(dest='command', required=True)
     for name in ('analyze', 'convert', 'verify'):
         p = sub.add_parser(name)
-        p.add_argument('source', help='the SMS Import / Export .zip, or the folder it was extracted to')
+        p.add_argument('source', help='the backup: a .zip or .xml file, or the folder an SMS Import / Export '
+                                      'export was extracted to')
         if name != 'analyze':
-            p.add_argument('output', help='the XML file to write / check, e.g. sms-20261005120000.xml')
+            p.add_argument('output', help='the file to write / check, e.g. sms-20261005120000.xml')
             p.add_argument('--sample', action='store_true',
                            help='write only a small representative test set')
+            p.add_argument('--keep', choices=('all', 'sms', 'mms'), default='all',
+                           help='which messages to write: all (default), only text messages (sms), or only '
+                                'picture and group messages (mms)')
+            p.add_argument('--no-groups', action='store_true', help='leave out group conversations (MMS)')
+            p.add_argument('--no-pdf', action='store_true', help='leave out PDF attachments')
             p.add_argument('--sub-id', default='unknown',
                            help='SIM id written for every message: "unknown" (-1, default; visible on any '
                                 'phone), "keep" (the old phone\'s values) or a number')
@@ -931,10 +1704,18 @@ def main():
                                 'replace them with U+FFFD')
         p.add_argument('--owner', help='your own number(s), comma-separated, if auto-detection is wrong')
         if name == 'convert':
-            p.add_argument('--force', action='store_true', help='replace an existing output file')
+            p.add_argument('--to', choices=TARGETS, default='sbr',
+                           help='the format to write: sbr (SMS Backup & Restore XML, default), fig (Fig / TAK: '
+                                'an SMS Import / Export ZIP) or wonder (a Wonder ZIP)')
+            p.add_argument('--split-mb', type=float, default=0,
+                           help='write outputs bigger than this many MB as several files (part1, part2, ...) '
+                                'to restore in order; 0 (default) writes one file')
+            p.add_argument('--force', action='store_true', help='replace existing output files')
     args = ap.parse_args()
     if getattr(args, 'sub_id', 'unknown') not in ('unknown', 'keep') and not is_int(args.sub_id):
         ap.error('--sub-id must be "unknown", "keep" or a number')
+    if args.command == 'verify':
+        args.to, args.split_mb = 'sbr', 0
     return {'analyze': cmd_analyze, 'convert': cmd_convert, 'verify': cmd_verify}[args.command](args)
 
 

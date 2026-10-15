@@ -1,8 +1,11 @@
-/* SMS Import / Export -> SMS Backup & Restore: the conversion engine.
+/* Message backup converter: the conversion engine.
  *
- * A port of assets/converter.js (itself a line-for-line port of cli/sie_to_sbr.py): the
- * same decisions and byte-identical XML. Pure JVM code with no Android dependency, so it
- * runs unchanged in the app and on a desktop (see Cli.kt). It never uses the network. */
+ * Reads Fig / TAK (SMS Import / Export), SMS Backup & Restore, Wonder, Pom and Buggy
+ * Backup backups (Formats.kt) and writes SMS Backup & Restore XML, Fig / TAK ZIPs or
+ * Wonder ZIPs (Output.kt). A port of assets/converter.js (itself a line-for-line port of
+ * cli/sie_to_sbr.py): the same decisions and byte-identical files. Pure JVM code with no
+ * Android dependency, so it runs unchanged in the app and on a desktop (see Cli.kt). It
+ * never uses the network. */
 package com.smsconverter.sie2sbr.core
 
 import java.io.BufferedWriter
@@ -51,12 +54,39 @@ internal val PART_ATTRS = listOf("seq", "ct", "name", "chset", "cd", "fn", "cid"
 internal val ADDR_ATTRS = listOf("address", "type", "charset")
 internal val SMS_TYPES = mapOf("1" to "received", "2" to "sent", "3" to "draft", "4" to "outbox", "5" to "failed", "6" to "queued")
 internal val MMS_BOXES = mapOf("1" to "received", "2" to "sent", "3" to "draft", "4" to "outbox")
+
+val TARGETS = listOf("sbr", "fig", "wonder")
+val TARGET_NAMES = mapOf("sbr" to "SMS Backup & Restore XML", "fig" to "Fig / TAK (SMS Import / Export ZIP)",
+    "wonder" to "Wonder ZIP")
+internal const val APP_PARTS = "/data/user_de/0/com.android.providers.telephony/app_parts/"  // where Android keeps MMS files
+// Buggy Backup stores each SMS as JSON with one-letter keys; these are the Android columns.
+internal val BUGGY_KEYS = listOf("q" to "address", "r" to "body", "m" to "date", "n" to "date_sent", "h" to "type",
+    "b" to "read", "k" to "protocol", "g" to "status", "d" to "locked", "l" to "sub_id", "o" to "creator", "e" to "seen")
+// File name extensions for attachments written to a Wonder ZIP.
+internal val EXTENSIONS = mapOf("image/jpeg" to "jpg", "image/jpg" to "jpg", "image/png" to "png", "image/gif" to "gif",
+    "image/bmp" to "bmp", "image/webp" to "webp", "audio/amr" to "amr", "audio/mpeg" to "mp3", "audio/mp4" to "m4a",
+    "video/mp4" to "mp4", "video/3gpp" to "3gp", "application/pdf" to "pdf", "text/x-vcard" to "vcf", "text/vcard" to "vcf")
+val DESCRIBE = mapOf(
+    "sie" to "Fig / TAK: SMS Import / Export (com.github.tmo1.sms_ie) export: messages.ndjson + data/",
+    "sbr" to "SMS Backup & Restore XML backup (attachments inside, as base64)",
+    "wonder" to "Wonder ZIP backup: an XML file + mms_attachments/",
+    "pom" to "Pom ZIP backup: sms.xml + mms.xml (attachments inside, as base64)",
+    "buggy" to "Buggy Backup ZIP: conversations/conv_N (SMS only)",
+)
 private val MONTHS = listOf("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
-/** sample: write a small test set. subId: "unknown" | "keep" | a number. tz: IANA zone for
- *  readable_date, null for this device's. nul: "strip" | "replace". owner: own number(s). */
+/** to: the format written, "sbr" | "fig" | "wonder". sample: write a small test set.
+ *  keep: "all" | "sms" | "mms". noGroups: leave out group MMS. noPdf: leave out PDF
+ *  attachments. splitMb: write outputs bigger than this as parts (0: one file).
+ *  subId: "unknown" | "keep" | a number. tz: IANA zone for readable_date, null for this
+ *  device's. nul: "strip" | "replace". owner: own number(s). */
 data class Options(
+    val to: String = "sbr",
     val sample: Boolean = false,
+    val keep: String = "all",
+    val noGroups: Boolean = false,
+    val noPdf: Boolean = false,
+    val splitMb: Double = 0.0,
     val subId: String = "unknown",
     val tz: String? = null,
     val nul: String = "strip",
@@ -155,7 +185,7 @@ fun esc(s: String): String {
 private val THOUSAND = BigInteger.valueOf(1000)
 private val MAX_SECS = BigInteger.valueOf(8_640_000_000_000L)  // the range of a JavaScript Date
 
-private fun floorDiv1000(ms: BigInteger): BigInteger {
+internal fun floorDiv1000(ms: BigInteger): BigInteger {
     val qr = ms.divideAndRemainder(THOUSAND)
     return if (qr[1].signum() < 0) qr[0] - BigInteger.ONE else qr[0]
 }
@@ -223,6 +253,29 @@ private fun illegalIn(s: String): List<Int> {
     return out ?: emptyList()
 }
 
+fun isPdf(p: JObj) = (sval(p, "ct") ?: "").split(';')[0].trim().lowercase(Locale.ROOT) == "application/pdf"
+
+/** The MMS parts that are written: all of them, or all but PDF files with noPdf. */
+fun writtenParts(m: Msg, options: Options): List<JObj> = if (options.noPdf) m.parts.filter { !isPdf(it) } else m.parts
+
+/** The UTF-8 size of a text; an unpaired surrogate counts as 3 bytes. */
+fun u8len(s: String?): Int {
+    if (s == null) return 0
+    var n = 0
+    var i = 0
+    while (i < s.length) {
+        val c = s[i]
+        n += when {
+            c.code < 0x80 -> 1
+            c.code < 0x800 -> 2
+            Character.isHighSurrogate(c) && i + 1 < s.length && Character.isLowSurrogate(s[i + 1]) -> { i++; 4 }
+            else -> 3
+        }
+        i++
+    }
+    return n
+}
+
 fun clean(s: String?, mode: String): String? {
     if (s.isNullOrEmpty() || illegalIn(s).isEmpty()) return s
     val b = StringBuilder(s.length)
@@ -255,22 +308,31 @@ internal fun digestOf(bytes: ByteArray) = digest(bytes)
 
 // ------------------------------------------------------------------------- source
 
-/** Read-only access to an SMS Import / Export export: messages.ndjson and data/PART_* files. */
-interface Source {
-    val kind: String     // "zip" or "folder"
+/** Read-only access to a backup: its records (load) and attachment files (by name). */
+interface Source : java.io.Closeable {
+    val kind: String     // "zip", "folder" or "file"
     val label: String
+    /** The attachment files there are (complete after load()). */
     val names: Set<String>
-    val ndjsonSize: Long
-    fun openNdjson(): InputStream
+    /** "sie" (Fig / TAK: SMS Import / Export), "sbr", "wonder", "pom" or "buggy". */
+    val format: String
+    val describe: String get() = DESCRIBE[format]!!
+    /** What a record number counts: a line of messages.ndjson, or a record of other formats. */
+    val unit: String get() = if (format == "sie") "line" else "record"
+    /** About how many bytes load() reads (for progress), or -1 if unknown. */
+    val loadSize: Long
+    fun load(onBytes: ((Long) -> Unit)? = null, cancelled: () -> Boolean = { false }): Loaded
     fun readPart(name: String): ByteArray
     fun partSize(name: String): Long
+    override fun close() {}
 }
 
 class SourceException(message: String) : Exception(message)
 
-/** A source backed by a ZIP archive. */
+/** An SMS Import / Export export (Fig, TAK) in a ZIP archive. */
 class ZipSource(private val zip: ZipArchive, override val label: String) : Source {
     override val kind = "zip"
+    override val format = "sie"
     private val ndjson: String
     private val members = HashMap<String, String>()
     override val names: Set<String>
@@ -291,8 +353,9 @@ class ZipSource(private val zip: ZipArchive, override val label: String) : Sourc
         names = keys
     }
 
-    override val ndjsonSize get() = zip.entries[ndjson]!!.usize
-    override fun openNdjson() = zip.open(ndjson)
+    override val loadSize get() = zip.entries[ndjson]!!.usize
+    fun openNdjson() = zip.open(ndjson)
+    override fun load(onBytes: ((Long) -> Unit)?, cancelled: () -> Boolean) = openNdjson().use { parseNdjson(it, onBytes, cancelled) }
     override fun readPart(name: String) = zip.read(members[name]!!)
     override fun partSize(name: String) = zip.entries[members[name]!!]!!.usize
 }
@@ -300,9 +363,10 @@ class ZipSource(private val zip: ZipArchive, override val label: String) : Sourc
 /** One file of an extracted export: its path relative to the chosen folder. */
 class SourceFile(val path: String, val size: Long, val open: () -> InputStream)
 
-/** A source backed by an extracted folder. */
+/** An extracted SMS Import / Export export (Fig, TAK). */
 class FolderSource(files: List<SourceFile>, override val label: String) : Source {
     override val kind = "folder"
+    override val format = "sie"
     private val nd: SourceFile
     private val partsByName = LinkedHashMap<String, SourceFile>()
     override val names: Set<String> get() = partsByName.keys
@@ -321,8 +385,9 @@ class FolderSource(files: List<SourceFile>, override val label: String) : Source
         }
     }
 
-    override val ndjsonSize get() = nd.size
-    override fun openNdjson() = nd.open()
+    override val loadSize get() = nd.size
+    fun openNdjson() = nd.open()
+    override fun load(onBytes: ((Long) -> Unit)?, cancelled: () -> Boolean) = openNdjson().use { parseNdjson(it, onBytes, cancelled) }
     override fun readPart(name: String) = partsByName[name]!!.open().use { it.readBytes() }
     override fun partSize(name: String) = partsByName[name]!!.size
 }
@@ -401,12 +466,9 @@ fun parseNdjson(input: InputStream, onBytes: ((Long) -> Unit)? = null, cancelled
             bad.add(line to "unreadable line: " + e.message)
             return
         }
-        when {
-            o !is JObj -> bad.add(line to "line is not a JSON object")
-            pick(o, K_PARTS) != null || o.has("msg_box") || o.has("m_type") -> msgs.add(Msg(line, "mms", o))
-            o.has("body") || o.has("address") -> msgs.add(Msg(line, "sms", o))
-            else -> bad.add(line to "neither an SMS nor an MMS record")
-        }
+        val kind = classify(o)
+        if (kind != null) msgs.add(Msg(line, kind, o as JObj))
+        else bad.add(line to if (o is JObj) "neither an SMS nor an MMS record" else "line is not a JSON object")
     }
 
     while (true) {
@@ -433,8 +495,16 @@ fun parseNdjson(input: InputStream, onBytes: ((Long) -> Unit)? = null, cancelled
     return Loaded(msgs, bad, blank)
 }
 
+/** "sms", "mms", or null for a record that is neither. */
+fun classify(o: Any?): String? {
+    if (o !is JObj) return null
+    if (pick(o, K_PARTS) != null || o.has("msg_box") || o.has("m_type")) return "mms"
+    if (o.has("body") || o.has("address")) return "sms"
+    return null
+}
+
 fun load(src: Source, onBytes: ((Long) -> Unit)? = null, cancelled: () -> Boolean = { false }): Loaded =
-    src.openNdjson().use { parseNdjson(it, onBytes, cancelled) }
+    src.load(onBytes, cancelled)
 
 // ------------------------------------------------------------------------- planning
 
@@ -617,9 +687,9 @@ private fun cmpInts(a: List<Int>, b: List<Int>): Int {
 }
 
 /** A small, representative test set; the same selection as the Python version. */
-fun pickSample(msgs: List<Msg>, plan: Plan): List<Msg> {
+fun pickSample(msgs: List<Msg>, plan: Plan, byChat: Boolean = false): List<Msg> {
     val byThread = LinkedHashMap<String?, MutableList<Msg>>()
-    for (m in msgs) byThread.getOrPut(sval(m.o, "thread_id")) { ArrayList() }.add(m)
+    for (m in msgs) byThread.getOrPut(if (byChat) chatKey(plan, m) else sval(m.o, "thread_id")) { ArrayList() }.add(m)
     fun media(m: Msg) = m.isMms && m.parts.any { partFile(it) != null }
     fun group(m: Msg) = m.isMms && plan.addressList(m).size > 1
     fun newest(ms: List<Msg>) = ms.sortedWith { a, b -> b.dateOrZero.compareTo(a.dateOrZero) }
@@ -630,7 +700,7 @@ fun pickSample(msgs: List<Msg>, plan: Plan): List<Msg> {
     for ((t, ms) in byThread) {
         val sms = ms.filter { it.isSms }
         val mms = ms.filter { it.isMms }
-        if (t == null || sms.isEmpty() || mms.isEmpty() || mms.any(::group)) continue
+        if (t == null || mms.any(::group)) continue
         val score = listOf(listOf("1", "2").count { b -> mms.any { media(it) && box(it) == b } },
             sms.map { sval(it.o, "type") }.toSet().size, ms.size)
         if (best == null || cmpInts(score, best.first) > 0) best = score to t
@@ -696,8 +766,8 @@ class Converter(private val src: Source, private val plan: Plan, private val opt
         return esc(v)
     }
 
-    private fun tag(indent: String, name: String, attrs: List<Pair<String, String>>, m: Msg,
-                    prefix: String = "", end: String = " />"): String {
+    internal fun tag(indent: String, name: String, attrs: List<Pair<String, String>>, m: Msg,
+                     prefix: String = "", end: String = " />"): String {
         val s = StringBuilder(indent).append('<').append(name)
         for ((k, v) in attrs) s.append(' ').append(k).append("=\"").append(text(v, m, prefix + k)).append('"')
         return s.append(end).append('\n').toString()
@@ -740,7 +810,7 @@ class Converter(private val src: Source, private val plan: Plan, private val opt
             if (v != null) attrs.add(k to v)
         }
         val out = StringBuilder(tag("  ", "mms", attrs, m, "", ">")).append("    <parts>\n")
-        for (p in m.parts) {
+        for (p in writtenParts(m, opts)) {
             val line = tag("      ", "part", PART_ATTRS.map { it to (sval(p, it) ?: "null") }, m, "part.", "")
             out.append(line, 0, line.length - 1)
             val name = partFile(p)
@@ -773,86 +843,18 @@ fun tzLabel(tz: String?) = tz ?: (localTimeZone() + " (this device's time zone)"
 
 fun header(count: Int, options: Options, now: ZonedDateTime): String =
     "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>\n" +
-        "<!--Converted from an SMS Import / Export backup by $APP $VERSION on " + localStamp(now) +
+        "<!--Converted by $APP $VERSION on " + localStamp(now) +
         ". readable_date values are in " + tzLabel(options.tz) + ".-->\n" +
         "<?xml-stylesheet type=\"text/xsl\" href=\"sms.xsl\"?>\n" +
         "<smses count=\"$count\" backup_set=\"" + UUID.randomUUID() + "\" backup_date=\"" +
         now.toInstant().toEpochMilli() + "\" type=\"full\">\n"
 
-class Result(
-    val src: Source, val loaded: Loaded, val plan: Plan, val conv: Converter,
-    val problems: List<Pair<Msg, String>>, val ok: List<Msg>, val chosen: List<Msg>,
-    val options: Options, val now: ZonedDateTime, val bytes: Long,
-)
-
-private class CountingStream(out: OutputStream) : FilterOutputStream(out) {
-    var count = 0L
-    override fun write(b: Int) {
-        out.write(b)
-        count++
-    }
-
-    override fun write(b: ByteArray, off: Int, len: Int) {
-        out.write(b, off, len)
-        count += len
-    }
-}
-
-/** Splits the records into convertible ones and problems, and picks what to write. */
-fun choose(loaded: Loaded, plan: Plan, options: Options): Triple<List<Pair<Msg, String>>, List<Msg>, List<Msg>> {
-    val problems = ArrayList<Pair<Msg, String>>()
-    val ok = ArrayList<Msg>()
-    for (m in loaded.msgs) {
-        val why = plan.problem(m)
-        if (why != null) problems.add(m to why) else ok.add(m)
-    }
-    return Triple(problems, ok, if (options.sample) pickSample(ok, plan) else ok)
-}
-
-/** Converts and writes the XML to out (which is flushed, not closed). progress(done, total). */
-fun convert(src: Source, loaded: Loaded, plan: Plan, options: Options, out: OutputStream,
-            now: ZonedDateTime = ZonedDateTime.now(), progress: ((Int, Int) -> Unit)? = null,
-            cancelled: () -> Boolean = { false }): Result {
-    val conv = Converter(src, plan, options)
-    val (problems, ok, chosen) = choose(loaded, plan, options)
-    val counting = CountingStream(out)
-    val w = BufferedWriter(OutputStreamWriter(counting, Charsets.UTF_8), 1 shl 16)
-    w.write(header(chosen.size, options, now))
-    for ((i, m) in chosen.withIndex()) {
-        if (cancelled()) throw CancellationException()
-        w.write(if (m.isSms) conv.sms(m) else conv.mms(m))
-        progress?.invoke(i + 1, chosen.size)
-    }
-    w.write("</smses>\n")
-    w.flush()
-    return Result(src, loaded, plan, conv, problems, ok, chosen, options, now, counting.count)
-}
-
 // ------------------------------------------------------------------------- manifest and report
 
-private fun csvField(v: Any?): String {
+internal fun csvField(v: Any?): String {
     if (v == null) return ""
     val s = v.toString()
     return if (s.any { it == '"' || it == ',' || it == '\r' || it == '\n' }) "\"" + s.replace("\"", "\"\"") + "\"" else s
-}
-
-/** One row per written message, identical to the Python version's .manifest.csv. */
-fun manifest(result: Result): String {
-    val rows = ArrayList<List<Any?>>()
-    rows.add(listOf("xml_index", "kind", "direction", "source_line", "source_id", "source_thread_id",
-        "source_sub_id", "written_sub_id", "date_ms", "date_utc", "address_written", "parts",
-        "attachments", "notes"))
-    for ((i, m) in result.chosen.withIndex()) {
-        val o = m.o
-        rows.add(listOf(i + 1, m.kind, m.direction, m.line, sval(o, "_id"), sval(o, "thread_id"), sval(o, "sub_id"),
-            subIdFor(o, result.options.subId), m.dateMs, utc(m.dateMs!!),
-            if (m.isMms) result.plan.addressList(m).joinToString("~") else sval(o, "address"),
-            if (m.isMms) m.parts.size else "", if (m.isMms) m.parts.count { partFile(it) != null } else "",
-            (result.conv.notes[m.line] ?: emptyList<String>()).joinToString("; ")))
-    }
-    val b = StringBuilder()
-    for (r in rows) b.append(r.joinToString(",") { csvField(it) }).append("\r\n")
-    return b.toString()
 }
 
 private fun <T> counted(items: List<T>, f: (T) -> String): String {
@@ -864,7 +866,13 @@ private fun <T> counted(items: List<T>, f: (T) -> String): String {
     return c.entries.sortedBy { it.key }.joinToString(", ") { it.key + " " + it.value }
 }
 
-private fun grouped(n: Long) = String.format(Locale.US, "%,d", n)
+internal fun grouped(n: Long) = String.format(Locale.US, "%,d", n)
+
+/** Old conversations: thread_id values in an SMS Import / Export export; other formats
+ *  have none, so their messages are grouped by participants. */
+fun countConversations(src: Source, msgs: List<Msg>, plan: Plan): Int =
+    if (src.format == "sie") msgs.map { sval(it.o, "thread_id") }.toSet().size
+    else msgs.filter { plan.problem(it) == null }.map { chatKey(plan, it) }.toSet().size
 
 /** Facts about the export, for the summary screen and the report. */
 class Summary(
@@ -891,7 +899,7 @@ fun summarize(src: Source, loaded: Loaded, plan: Plan): Summary {
     val max = dates.maxOrNull()
     val refSet = refs.toSet()
     val unreferenced = src.names.count { it !in refSet }
-    val conversations = msgs.map { sval(it.o, "thread_id") }.toSet().size
+    val conversations = countConversations(src, msgs, plan)
     val lines = msgs.size + loaded.bad.size + loaded.blank
     val owner = plan.owner.sorted().map(::mask)
     return Summary(
@@ -904,16 +912,16 @@ fun summarize(src: Source, loaded: Loaded, plan: Plan): Summary {
         listOf(
             "SOURCE",
             "  name:              ${src.label} (${src.kind})",
-            "  format:            SMS Import / Export (com.github.tmo1.sms_ie) export: messages.ndjson + data/",
-            "  records:           $lines lines (${loaded.blank} blank, ${loaded.bad.size} unreadable)",
+            "  format:            ${src.describe}",
+            "  records:           $lines ${if (src.unit == "line") "lines" else "records"} (${loaded.blank} blank, ${loaded.bad.size} unreadable)",
             "  SMS:               ${sms.size} (" + counted(sms) { it.direction } + ")",
             "  MMS:               ${mms.size} (" + counted(mms) { it.direction } + ")",
             "  MMS parts:         ${allParts.size} (" + counted(allParts) {
                 if (sval(it, "ct") == "application/smil") "SMIL" else if (partFile(it) != null) "attachment" else "text"
             } + ")",
             "  attachment files:  ${refs.size} referenced, ${found.size} present, ${refs.size - found.size} missing, " +
-                "$empty empty (0 bytes); $unreferenced file(s) in data/ not referenced by any part",
-            "  conversations:     $conversations thread_id values",
+                "$empty empty (0 bytes); $unreferenced file(s) not referenced by any part",
+            "  conversations:     $conversations " + if (src.format == "sie") "thread_id values" else "(by participants)",
             "  owner number:      " + owner.joinToString(", ").ifEmpty { "unknown" } + " (from ${plan.ownerHow})",
             if (min != null && max != null) "  dates:             " + utc(min, false) + " .. " + utc(max, false)
             else "  dates:             none",
@@ -922,70 +930,37 @@ fun summarize(src: Source, loaded: Loaded, plan: Plan): Summary {
     )
 }
 
-fun notCarried(msgs: List<Msg>, subPolicy: String): List<String> {
-    val knownSms = (SMS_ORDER + K_NAME).toSet()
-    val knownMms = (MMS_ORDER + K_PARTS + K_SENDER + K_RECIPS + K_NAME).toSet()
+/** Source fields with no place in the target format (reported, not hidden). */
+fun notCarried(msgs: List<Msg>, options: Options): List<String> {
+    class Known(val sms: Set<String>, val mms: Set<String>, val part: Set<String>, val addr: Set<String>)
+    val known = when (options.to) {
+        "fig" -> null  // every column is kept
+        "wonder" -> Known(setOf("address", "body", "date", "date_sent", "type", "read", "seen"),
+            (listOf("date", "read", "msg_box", "ct_t", "m_type", "seen") + K_PARTS + K_SENDER + K_RECIPS).toSet(),
+            setOf("ct", "name", "cl", "text", "_data"), setOf("address", "type"))
+        else -> Known((SMS_ORDER + K_NAME).toSet(), (MMS_ORDER + K_PARTS + K_SENDER + K_RECIPS + K_NAME).toSet(),
+            (PART_ATTRS + "_data").toSet(), (ADDR_ATTRS + K_NAME).toSet())
+    }
     val c = HashMap<String, Int>()
     fun add(k: String) {
         c[k] = (c[k] ?: 0) + 1
     }
     for (m in msgs) {
-        if (m.isSms) {
-            for (k in m.o.keyList) if (k !in knownSms) add("sms.$k")
-        } else {
-            for (k in m.o.keyList) if (k !in knownMms) add("mms.$k")
-            for (p in m.parts) for (k in p.keyList) if (k !in PART_ATTRS && k != "_data") add("part.$k")
-            for (r in m.addrRows) for (k in r.keyList) if (k !in ADDR_ATTRS && k !in K_NAME) add("addr.$k")
+        if (known != null) {
+            if (m.isSms) {
+                for (k in m.o.keyList) if (k !in known.sms) add("sms.$k")
+            } else {
+                for (k in m.o.keyList) if (k !in known.mms) add("mms.$k")
+                for (p in m.parts) for (k in p.keyList) if (k !in known.part) add("part.$k")
+                for (r in m.addrRows) for (k in r.keyList) if (k !in known.addr) add("addr.$k")
+            }
         }
-        if (subPolicy != "keep" && sval(m.o, "sub_id") != null) add(m.kind + ".sub_id (old phone value)")
+        if (options.subId != "keep" && sval(m.o, "sub_id") != null) add(m.kind + ".sub_id (old phone value)")
     }
-    val lines = arrayListOf("  source fields not stored in the XML (no matching field in SMS Backup & Restore's format,",
+    val lines = arrayListOf("  source fields not stored in the ${if (options.to == "fig") "ZIP" else "XML"} (no matching field in its format,",
         "  or specific to the old phone; ids and sub_id are kept in the manifest):")
     val keys = c.keys.sorted()
     for (k in keys) lines.add("    " + k.padEnd(34) + " " + c[k])
     if (keys.isEmpty()) lines.add("    none")
     return lines
-}
-
-/** The conversion report (.report.txt). */
-fun report(result: Result, fileName: String, verification: Verification?): String {
-    val conv = result.conv
-    val options = result.options
-    val chosen = result.chosen
-    val problems = result.problems
-    val bad = result.loaded.bad
-    val lines = ArrayList<String>()
-    lines.add("SMS Import / Export -> SMS Backup & Restore conversion report ($APP $VERSION for Android)")
-    lines.add("generated " + localStamp(result.now))
-    lines.add("")
-    lines.addAll(summarize(result.src, result.loaded, result.plan).text)
-    lines.addAll(listOf("", "CONVERSION",
-        "  output:            $fileName (" + grouped(result.bytes) + " bytes)",
-        "  mode:              " + if (options.sample) "test sample" else "all messages",
-        "  written:           ${chosen.count { it.isSms }} SMS + ${chosen.count { it.isMms }} MMS = ${chosen.size} " +
-            "messages (count=\"${chosen.size}\")",
-        "  attachments:       ${conv.attachments - conv.attachmentsMissing} written (" + grouped(conv.attachmentBytes) +
-            " bytes), ${conv.attachmentsEmpty} empty in the export, ${conv.attachmentsMissing} missing from the export",
-        "  not convertible:   ${problems.size + bad.size} record(s)" + if (problems.isNotEmpty() || bad.isNotEmpty()) "" else " (none)"))
-    for ((m, why) in problems) lines.add("    line ${m.line} (${m.kind}): $why")
-    for ((line, why) in bad) lines.add("    line $line: $why")
-    lines.add("  sub_id (SIM):      " + when (options.subId) {
-        "unknown" -> "written as -1 (\"SIM unknown\") for every message; the old phone's values are in the manifest"
-        "keep" -> "the old phone's values written unchanged"
-        else -> "written as ${options.subId} for every message"
-    })
-    lines.add("  text changes:      ${conv.changes.size} field(s) had characters XML cannot store (" +
-        (if (options.nul == "strip") "removed" else "replaced by U+FFFD") + ")" + if (conv.changes.isNotEmpty()) "" else " - none")
-    for (c in conv.changes) lines.add("    line ${c.line} (${c.kind} ${c.field}): ${c.count} x " + c.chars.joinToString("/"))
-    lines.add("  MMS whose \"address\" comes from their conversation (headers list fewer people): ${conv.mmsAddressFromConversation}")
-    for (m in chosen) {
-        if ((conv.notes[m.line] ?: emptyList<String>()).any { it.startsWith("MMS headers") }) {
-            lines.add("    line ${m.line} (thread ${sval(m.o, "thread_id")})")
-        }
-    }
-    for (m in chosen) for (n in conv.notes[m.line] ?: emptyList<String>()) if ("attachment" in n) lines.add("    line ${m.line}: $n")
-    lines.addAll(notCarried(chosen, options.subId))
-    lines.add("")
-    if (verification != null) lines.addAll(verification.lines)
-    return lines.joinToString("\n") + "\n"
 }

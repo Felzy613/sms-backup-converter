@@ -37,7 +37,7 @@ private fun expectedMms(m: Msg, opts: Options): List<Any?> {
     fun v(r: JObj, k: String) = sval(r, k)?.let { clean(it, opts.nul) } ?: "null"
     return listOf(m.dateMs.toString(), subIdFor(o, opts.subId),
         MMS_COPIED.map { k -> sval(o, k)?.let { clean(it, opts.nul) } ?: if (k in MMS_OMIT) null else "null" },
-        m.parts.map { p -> PART_ATTRS.map { v(p, it) } },
+        writtenParts(m, opts).map { p -> PART_ATTRS.map { v(p, it) } },
         m.addrRows.map { r -> ADDR_ATTRS.map { v(r, it) } })
 }
 
@@ -61,13 +61,14 @@ private class Counting(input: InputStream, private val onBytes: ((Long) -> Unit)
     }
 }
 
-/** Re-reads the written file with a strict XML parser (the platform's SAX parser: Expat on
- *  Android) and compares every element, field by field and every attachment by SHA-256,
- *  with the source record it was written from, in order. Also predicts the conversations
- *  Android will file the messages under after the restore. */
-fun verify(input: InputStream, result: Result, onBytes: ((Long) -> Unit)? = null,
+/** Re-reads a written SMS Backup & Restore file with a strict XML parser (the platform's
+ *  SAX parser: Expat on Android) and compares every element, field by field and every
+ *  attachment by SHA-256, with the source record it was written from, in order (msgs: the
+ *  messages of this file). Also predicts the conversations Android will file the messages
+ *  under after the restore. */
+fun verify(input: InputStream, job: Job, msgs: List<Msg>, onBytes: ((Long) -> Unit)? = null,
            cancelled: () -> Boolean = { false }): Verification {
-    val v = Verifier(result, cancelled)
+    val v = Verifier(job, msgs, cancelled)
     val stream = BufferedInputStream(Counting(input, onBytes), 1 shl 16)
     stream.mark(256)
     val head = ByteArray(200)
@@ -92,10 +93,10 @@ fun verify(input: InputStream, result: Result, onBytes: ((Long) -> Unit)? = null
     return v.finish()
 }
 
-private class Verifier(private val result: Result, private val cancelled: () -> Boolean) : DefaultHandler() {
-    private val plan = result.plan
-    private val opts = result.options
-    private val chosen = result.chosen
+private class Verifier(private val job: Job, private val chosen: List<Msg>, private val cancelled: () -> Boolean) : DefaultHandler() {
+    private val plan = job.plan
+    private val opts = job.options
+    private val sie = job.src.format == "sie"  // other formats have no thread_id
     val errors = ArrayList<String>()
 
     private var depth = 0
@@ -193,10 +194,10 @@ private class Verifier(private val result: Result, private val cancelled: () -> 
             } else {
                 same = listOf(attrs["date"], attrs["sub_id"], MMS_COPIED.map { attrs[it] }, parts.map { it.first }, addrs) ==
                     expectedMms(m, opts)
-                for ((i, p) in m.parts.withIndex()) {
+                for ((i, p) in writtenParts(m, opts).withIndex()) {
                     if (!same) break
                     val name = partFile(p)
-                    val want = if (name != null && name in result.src.names) result.conv.digests[name] else null
+                    val want = if (name != null && name in job.src.names) job.conv.digests[name] else null
                     same = parts[i].second == want
                     if (same && want != null) attachments++
                 }
@@ -257,12 +258,13 @@ private class Verifier(private val result: Result, private val cancelled: () -> 
             "    compared: addresses, bodies/texts, dates (MMS seconds x 1000), type/msg_box, read,",
             "    seen, status, every MMS header, every part, every addr row",
             "  attachments checked:      $attachments (decoded back from the XML and compared by SHA-256)",
-            "  conversations predicted after restore: ${owners.size} (from ${byThread.size} old thread_id values)")
-        val split = byThread.entries.filter { it.value.size > 1 }.sortedBy { it.key.toString() }
+            "  conversations predicted after restore: ${owners.size}" +
+                if (sie) " (from ${byThread.size} old thread_id values)" else "")
+        val split = byThread.entries.filter { it.value.size > 1 && it.key != null }.sortedBy { it.key.toString() }
         for ((t, keys) in split) {
             lines.add("    old thread ${t ?: "None"} will appear as ${keys.size} conversations: " + keys.joinToString(" + ") { show(it) })
         }
-        for ((k, ts) in owners) {
+        for ((k, ts) in if (sie) owners else emptyMap()) {
             if (ts.size > 1) {
                 lines.add("    old threads [" + ts.sortedBy { it.toString() }.joinToString(", ") { repr(it) } +
                     "] will share one conversation [" + k.joinToString(", ") { mask(it) } + "]")

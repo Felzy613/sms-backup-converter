@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!-- The page may not contact any server: your messages never leave this device. -->
   <meta http-equiv="Content-Security-Policy" content="connect-src 'none'; form-action 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'">
-  <meta name="description" content="Convert an SMS Import / Export backup into a file SMS Backup &amp; Restore can restore. Runs entirely in your browser.">
+  <meta name="description" content="Move text messages between phones: convert Fig, TAK, Wonder, Pom, Buggy Backup and SMS Backup &amp; Restore backups. Runs entirely in your browser.">
   <title>SMS Backup Converter</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Cpath d='M8 10h16v10H14l-4 4v-4H8z' fill='white'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="assets/style.css">
@@ -14,17 +14,17 @@
   <main>
     <header class="intro">
       <h1>SMS Backup Converter</h1>
-      <p>Turns an <strong>SMS Import / Export</strong> backup into a file that <strong>SMS Backup &amp; Restore</strong> can restore on your new phone: texts, picture messages, group chats and all.</p>
+      <p>Moves your texts, picture messages and group chats to another phone, even when the two phones save their backups in different formats: <strong>Fig</strong>, <strong>TAK</strong>, <strong>Wonder</strong>, <strong>Pom</strong>, <strong>Buggy Backup</strong> and <strong>SMS Backup &amp; Restore</strong> (any Android phone, including the MindPhone).</p>
       <p class="badge" title="The page is not allowed to contact any server."><span aria-hidden="true">🔒</span> Works offline. Your messages never leave this device.</p>
     </header>
 
     <section class="card" id="step-open" aria-labelledby="h-open">
       <h2 id="h-open"><span class="num">1</span> Open your backup</h2>
-      <p>Choose the <code>messages-YYYY-MM-DD.zip</code> file that SMS Import / Export made, or the folder you unzipped it into (the one that contains <code>messages.ndjson</code> and <code>data</code>).</p>
+      <p>Choose the backup from your old phone: the <code>messages-YYYY-MM-DD.zip</code> of a Fig or TAK (SMS Import / Export), an SMS Backup &amp; Restore <code>sms-….xml</code> file, or a Wonder, Pom or Buggy Backup ZIP file. An unzipped Fig or TAK backup works too: choose the folder that contains <code>messages.ndjson</code>.</p>
       <div class="drop" id="drop" tabindex="-1">
-        <p class="drop-hint">Drop the ZIP file or folder here</p>
+        <p class="drop-hint">Drop the backup file or folder here</p>
         <div class="buttons">
-          <label class="button primary">Choose ZIP file<input type="file" id="pick-zip" accept=".zip,application/zip" hidden></label>
+          <label class="button primary">Choose backup file<input type="file" id="pick-zip" accept=".zip,.xml,application/zip,text/xml,application/xml" hidden></label>
           <label class="button">Choose folder<input type="file" id="pick-folder" webkitdirectory hidden></label>
         </div>
       </div>
@@ -35,8 +35,33 @@
       <h2 id="h-summary"><span class="num">2</span> What's in it</h2>
       <dl class="stats" id="stats"></dl>
       <ul class="notes" id="summary-notes"></ul>
+    </section>
+
+    <section class="card" id="step-target" aria-labelledby="h-target" hidden>
+      <h2 id="h-target"><span class="num">3</span> Choose the new phone and what to keep</h2>
+      <fieldset>
+        <legend>Make a backup for</legend>
+        <label><input type="radio" name="to" value="sbr" checked> <strong>SMS Backup &amp; Restore</strong>: any Android phone, including the MindPhone</label>
+        <label><input type="radio" name="to" value="fig"> <strong>Fig or TAK</strong> (imported with SMS Import / Export)</label>
+        <label><input type="radio" name="to" value="wonder"> <strong>Wonder</strong></label>
+        <p class="hint" id="target-hint"></p>
+      </fieldset>
+      <fieldset>
+        <legend>What to keep</legend>
+        <label><input type="radio" name="keep" value="all" checked> Everything</label>
+        <label><input type="radio" name="keep" value="sms"> Only text messages (SMS)</label>
+        <label><input type="radio" name="keep" value="mms"> Only picture and group messages (MMS)</label>
+        <label><input type="checkbox" id="no-groups"> Leave out group chats</label>
+        <label><input type="checkbox" id="no-pdf"> Leave out PDF files</label>
+        <p class="hint">Leaving things out makes the new backup smaller; some phones' messaging apps cannot show PDF files.</p>
+      </fieldset>
       <details class="options">
-        <summary>Options</summary>
+        <summary>More options</summary>
+        <fieldset>
+          <legend>Big backups</legend>
+          <label><input type="checkbox" id="split"> Save as several files of at most <input type="number" id="split-mb" min="1" step="any" value="500" inputmode="decimal" class="small"> MB</label>
+          <p class="hint">Restore the parts in order, part 1 first. Browsers that cannot save straight to disk (Safari, Firefox, phones) split backups over 500 MB by themselves.</p>
+        </fieldset>
         <fieldset>
           <legend>SIM card id written into each message</legend>
           <label><input type="radio" name="subid" value="unknown" checked> "Unknown SIM" (recommended)</label>
@@ -63,7 +88,7 @@
     </section>
 
     <section class="card" id="step-create" aria-labelledby="h-create" hidden>
-      <h2 id="h-create"><span class="num">3</span> Create the backup files</h2>
+      <h2 id="h-create"><span class="num">4</span> Create the backup files</h2>
       <p>Make the small <strong>test file</strong> first and restore it on the new phone. If it looks right, make and restore the <strong>full backup</strong>; messages that are already on the phone are skipped.</p>
       <div class="buttons">
         <button type="button" class="button" id="make-test">Create test file</button>
@@ -79,24 +104,27 @@
     </section>
 
     <section class="card" id="step-restore" aria-labelledby="h-restore">
-      <h2 id="h-restore"><span class="num">4</span> Restore on your new phone</h2>
-      <ol class="steps">
-        <li>Install <strong>SMS Backup &amp; Restore</strong> (by SyncTech) from Google Play and open it.</li>
-        <li>In its <em>Settings → Backup settings → Local backup folder</em>, choose or create a folder, for example <code>SMSBackupRestore</code>.</li>
-        <li>Copy the file you created into that folder on the phone (USB cable, a USB stick, or a cloud drive and the phone's Files app). Keep the name starting with <code>sms-</code>.</li>
-        <li>Optional: <em>Menu → View backups</em> shows what's in the file without changing anything.</li>
-        <li>Tap <em>Restore</em>, pick the file, tick <em>Messages</em> and start. Allow the app to be your SMS app while it restores, then switch back to your usual messaging app.</li>
-        <li>Do the test file first. Check names, times, sent/received sides, photos and group chats. Then restore the full backup the same way.</li>
-      </ol>
+      <h2 id="h-restore"><span class="num">5</span> Restore on your new phone</h2>
+      <ol class="steps" id="restore-steps"></ol>
+      <details>
+        <summary>Good to know</summary>
+        <ul class="notes">
+          <li>The <strong>MindPhone</strong> restores with SMS Backup &amp; Restore: choose that format.</li>
+          <li>A phone that already has messages keeps them. Restoring adds the old messages, files them into the same chats, and skips any message that is already there, so nothing shows up twice.</li>
+          <li>Moving between a <strong>Fig</strong> and a <strong>TAK</strong>? They save messages the same way: copy the backup to the other phone as it is. Convert only to leave things out.</li>
+          <li>Several parts: restore part 1 first, then the others in order. Each one adds its messages; nothing is lost.</li>
+          <li>Keep your original backup until you have checked the restored messages.</li>
+        </ul>
+      </details>
       <details>
         <summary>If the messages don't show up</summary>
-        <p>Wait a minute and restart the phone. If they are still missing, your phone's messaging app may want a real SIM id instead of "unknown": send one text on the new phone, make a messages backup with SMS Backup &amp; Restore, open that file in a text editor and note the number in <code>sub_id="…"</code>. Then come back here, choose <em>Options → Use this id</em> with that number, and create the files again.</p>
+        <p>Wait a minute and restart the phone. If they are still missing, your phone's messaging app may want a real SIM id instead of "unknown": send one text on the new phone, make a messages backup with SMS Backup &amp; Restore, open that file in a text editor and note the number in <code>sub_id="…"</code>. Then come back here, choose <em>More options → Use this id</em> with that number, and create the files again.</p>
       </details>
     </section>
 
     <footer>
       <p><a href="https://github.com/Felzy613/FIg-SMS-to-SyncTech-SMS-Backup-and-Restore">Source code and help</a> · <a href="https://github.com/Felzy613/FIg-SMS-to-SyncTech-SMS-Backup-and-Restore/releases">Android app</a> · version <span id="version"></span></p>
-      <p>Not affiliated with SyncTech (SMS Backup &amp; Restore) or the SMS Import / Export project.</p>
+      <p>Not affiliated with SyncTech (SMS Backup &amp; Restore), the SMS Import / Export project, or the makers of the phones named here.</p>
     </footer>
   </main>
   <script src="assets/zip.js"></script>

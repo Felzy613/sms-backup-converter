@@ -12,8 +12,13 @@ and lines that are not valid JSON.
 
 writes OUTPUT_DIR/messages-2026-01-15/ (the extracted folder) and three ZIP files of
 it: deflated, written with data descriptors (as Android's ZipOutputStream does), and
-with everything inside a parent folder.
+with everything inside a parent folder. It also writes backups in the other formats the
+converter reads, each with its own tricky cases: sbr-2026-01-15.xml (SMS Backup &
+Restore) and sbr-zipped.zip, wonder-2026-01-15.zip, pom-2026-01-15.zip and
+buggy-2026-01-15.zip.
 """
+
+import base64
 
 import io
 import json
@@ -233,7 +238,189 @@ def main(outdir):
     with open(os.path.join(outdir, 'messages-descriptors.zip'), 'wb') as raw:
         with zipfile.ZipFile(Unseekable(raw), 'w', zipfile.ZIP_DEFLATED) as z:
             add_all(z)
+    other_formats(outdir)
     print('fixture written to', outdir)
+
+
+def ms(minutes):
+    return str((T0 + minutes * 60) * 1000)
+
+
+def b64(data):
+    return base64.b64encode(data).decode('ascii')
+
+
+PDF = b'%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n'
+SMIL = ('&lt;smil&gt;&lt;body&gt;&lt;par dur=&quot;5000ms&quot;&gt;&lt;img src=&quot;image0.png&quot; '
+        'region=&quot;Image&quot;/&gt;&lt;/par&gt;&lt;/body&gt;&lt;/smil&gt;')
+
+
+def sbr_xml():
+    """An SMS Backup & Restore file written by hand, with the XML features a real one may
+    use: entities, character references, single-quoted attributes, a literal line break
+    inside an attribute (which XML turns into a space), comments, "null" values."""
+    image = b64(png(3, 2, (10, 20, 200)))
+    return (
+        "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>\n"
+        "<!--File Created By SMS Backup & Restore (made-up test data)-->\n"
+        '<?xml-stylesheet type="text/xsl" href="sms.xsl"?>\n'
+        '<smses count="13" backup_set="00000000-0000-4000-8000-000000000000" backup_date="1768478400000" type="full">\n'
+        '  <sms protocol="0" address="+15550100201" date="%s" type="1" subject="null" body="Hi from SBR &amp; friends &lt;3" '
+        'toa="null" sc_toa="null" service_center="null" read="1" status="-1" locked="0" date_sent="%s" sub_id="3" '
+        'readable_date="Jan 1, 2026 12:10:00 AM" contact_name="Alex Example" />\n'
+        '  <sms protocol="0" address="+15550100201" date="%s" type="2" subject="null" body="Line one&#10;Line two&#13;&#10;three" '
+        'toa="null" sc_toa="null" service_center="null" read="1" status="0" locked="0" date_sent="0" sub_id="3" '
+        'readable_date="Jan 1, 2026 12:11:00 AM" contact_name="(Unknown)" />\n'
+        "  <sms address='5550100201' date='%s' type='1' body='single \"quoted\" attribute' read='1' status='-1' "
+        "contact_name='Alex Example' />\n"
+        '  <sms address="+15550100202" date="%s" type="1" body="literal\nline break and\ttab" read="0" status="-1" '
+        'contact_name="Bea Sample" />\n'
+        '  <!-- a comment between messages -->\n'
+        '  <sms address="+15550100202" date="%s" type="2" body="emoji &#x1F600; and &#128512; &apos;x&apos;" read="1" />\n'
+        '  <sms address="5550100204" date="%s" type="1" body="null" read="1" status="-1" contact_name="null" />\n'
+        '  <sms address="72975" date="%s" type="2" body="no read or status" />\n'
+        '  <mms date="%s" rr="null" sub="null" ct_t="application/vnd.wap.multipart.related" read_status="null" seen="1" '
+        'msg_box="1" address="+15550100201" sub_cs="null" resp_st="null" retr_st="null" d_tm="null" text_only="0" '
+        'exp="604800" locked="0" m_id="SBRMID1" st="null" retr_txt_cs="null" retr_txt="null" date_sent="0" read="1" '
+        'm_size="1234" rpt_a="null" ct_cls="null" pri="129" sub_id="3" tr_id="SBRTR1" resp_txt="null" ct_l="null" '
+        'm_cls="personal" d_rpt="129" v="18" m_type="132" readable_date="Jan 1, 2026 12:40:00 AM" contact_name="Alex Example">\n'
+        '    <parts>\n'
+        '      <part seq="-1" ct="application/smil" name="smil.xml" chset="106" cd="null" fn="null" cid="&lt;smil&gt;" '
+        'cl="smil.xml" ctt_s="null" ctt_t="null" text="%s" />\n'
+        '      <part seq="0" ct="image/png" name="image0.png" chset="null" cd="null" fn="null" cid="&lt;image0&gt;" '
+        'cl="image0.png" ctt_s="null" ctt_t="null" text="null" data="%s" />\n'
+        '      <part seq="0" ct="text/plain" name="text0.txt" chset="106" cd="null" fn="null" cid="&lt;text0&gt;" '
+        'cl="text0.txt" ctt_s="null" ctt_t="null" text="Look at this" />\n'
+        '    </parts>\n'
+        '    <addrs>\n'
+        '      <addr address="+15550100201" type="137" charset="106" />\n'
+        '      <addr address="+15550100100" type="151" charset="106" />\n'
+        '    </addrs>\n'
+        '  </mms>\n'
+        '  <mms date="%s" msg_box="2" m_type="128" read="1" seen="1" ct_t="application/vnd.wap.multipart.related" sub_id="3" '
+        'address="+15550100201~+15550100202~+15550100203" contact_name="Alex Example, Bea Sample, Cam Test">\n'
+        '    <parts>\n'
+        '      <part seq="0" ct="text/plain" name="null" chset="106" cd="null" fn="null" cid="null" cl="null" ctt_s="null" '
+        'ctt_t="null" text="Group reply from SBR" />\n'
+        '    </parts>\n'
+        '    <addrs>\n'
+        '      <addr address="+15550100202" type="151" charset="106" />\n'
+        '      <addr address="+15550100100" type="137" charset="106" />\n'
+        '      <addr address="+15550100201" type="151" charset="106" />\n'
+        '      <addr address="+15550100203" type="151" charset="106" />\n'
+        '    </addrs>\n'
+        '  </mms>\n'
+        '  <mms date="%s" msg_box="1" m_type="132" read="1" ct_t="application/vnd.wap.multipart.mixed" sub="Forms">\n'
+        '    <parts>\n'
+        '      <part seq="0" ct="application/pdf" name="form.pdf" cl="form.pdf" text="null" data="%s" />\n'
+        '      <part seq="0" ct="text/plain" text="The form, as a PDF" />\n'
+        '      <part seq="0" ct="image/jpeg" cl="empty.jpg" text="null" data="" />\n'
+        '      <part seq="0" ct="image/jpeg" cl="broken.jpg" text="null" data="!!not base64!!" />\n'
+        '      <part seq="0" ct="image/png" cl="wrapped.png" text="null" data="%s" />\n'
+        '    </parts>\n'
+        '    <addrs>\n'
+        '      <addr address="+15550100203" type="137" charset="106" />\n'
+        '      <addr address="+15550100100" type="151" charset="106" />\n'
+        '    </addrs>\n'
+        '  </mms>\n'
+        '</smses>\n') % (ms(10), ms(9), ms(11), ms(12), ms(13), ms(14), ms(15), ms(16), ms(40), SMIL, image, ms(41),
+                          ms(42), b64(PDF), '&#10;'.join(image[i:i + 20] for i in range(0, len(image), 20)))
+
+
+def wonder_xml():
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<messages sms_count="3" mms_count="3">\n'
+        '  <sms address="+15550100201" body="Hello from Wonder" date="%s" date_sent="0" type="1" read="1" seen="1" />\n'
+        '  <sms address="+15550100201" body="Reply &amp; more&#10;on two lines" date="%s" type="2" read="1" />\n'
+        '  <sms address="+15550100205" body="" date="%s" type="1" read="0" seen="0" />\n'
+        '  <mms date="%d" read="1" msg_box="1" ct_t="application/vnd.wap.multipart.related" m_type="132" seen="1">\n'
+        '    <addr address="+15550100201" type="137" />\n'
+        '    <addr address="+15550100100" type="151" />\n'
+        '    <part ct="application/smil" name="smil.xml" cl="smil.xml" text="%s" />\n'
+        '    <part ct="image/jpeg" name="photo.jpg" cl="photo.jpg" file="mms_1_1.jpg" />\n'
+        '    <part ct="text/plain" text="Wonder picture" />\n'
+        '  </mms>\n'
+        '  <mms date="%d" read="1" msg_box="2" m_type="128" seen="1">\n'
+        '    <addr address="+15550100100" type="137" />\n'
+        '    <addr address="+15550100201" type="151" />\n'
+        '    <addr address="+15550100202" type="151" />\n'
+        '    <addr address="+15550100203" type="151" />\n'
+        '    <part ct="text/plain" text="Wonder group" />\n'
+        '  </mms>\n'
+        '  <mms date="%d" read="0" msg_box="1" m_type="132">\n'
+        '    <addr address="+15550100203" type="137" />\n'
+        '    <addr address="+15550100100" type="151" />\n'
+        '    <part ct="image/jpeg" cl="lost.jpg" file="mms_3_9.jpg" />\n'
+        '    <part ct="application/pdf" cl="menu.pdf" file="mms_3_2.pdf" />\n'
+        '    <part ct="text/plain" text="Missing photo, and a PDF" />\n'
+        '  </mms>\n'
+        '</messages>\n') % (ms(100), ms(101), ms(102), T0 + 103 * 60, SMIL, T0 + 104 * 60, T0 + 105 * 60)
+
+
+def pom_files():
+    sms_xml = (
+        "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>\n<smses count=\"2\">\n"
+        '  <sms protocol="0" address="+15550100201" date="%s" type="1" subject="null" body="Pom text &amp; more" '
+        'service_center="null" read="1" status="-1" locked="0" date_sent="0" toa="null" sc_toa="null" '
+        'readable_date="null" contact_name="null" />\n'
+        '  <sms protocol="0" address="+15550100201" date="%s" type="2" subject="null" body="Pom reply" '
+        'service_center="null" read="1" status="0" locked="0" date_sent="0" toa="null" sc_toa="null" '
+        'readable_date="null" contact_name="Alex Example" />\n'
+        '</smses>\n') % (ms(200), ms(201))
+    mms_xml = (
+        "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>\n<mmses count=\"2\">\n"
+        '  <mms date="%d" msg_box="1" ct_t="application/vnd.wap.multipart.related" m_type="132" read="1" seen="1" '
+        'm_id="null" tr_id="POMTR1" sub_id="2">\n'
+        '    <addr address="+15550100201/TYPE=PLMN" type="137" charset="106" />\n'
+        '    <addr address="+15550100100/TYPE=PLMN" type="151" charset="106" />\n'
+        '    <part seq="0" ct="image/png" name="pic.png" cl="pic.png" text="null" _data_b64="%s" />\n'
+        '    <part seq="0" ct="text/plain" name="null" text="Pom picture" _data_b64="null" />\n'
+        '  </mms>\n'
+        '  <mms date="%d" msg_box="2" m_type="128" read="1" seen="1">\n'
+        '    <r address="+15550100201" />\n'
+        '    <part ct="text/plain" text="Pom sent, recipients only" />\n'
+        '  </mms>\n'
+        '</mmses>\n') % (T0 + 202 * 60, b64(png(2, 3, (240, 200, 0))), T0 + 203 * 60)
+    return sms_xml, mms_xml
+
+
+def buggy_entries():
+    return [
+        ('conversations/', None),
+        ('conversations/conv_1', {'q': '+15550100201', 'r': 'Buggy hello', 'm': (T0 + 300 * 60) * 1000,
+                                  'n': (T0 + 300 * 60 - 5) * 1000, 'h': 1, 'b': True, 'k': 0, 'g': -1, 'd': False,
+                                  'l': 1, 'o': 'com.example.buggy', 'e': True, 'z': 'a key nobody knows'}),
+        ('conversations/conv_10', {'q': '+15550100202', 'r': 'Buggy tenth (sorted after conv_2)',
+                                   'm': (T0 + 310 * 60) * 1000, 'h': 1, 'b': False}),
+        ('conversations/conv_2', {'q': '+15550100201', 'r': 'Buggy reply \U0001F44D', 'm': str((T0 + 302 * 60) * 1000),
+                                  'h': 2, 'b': True, 'd': True}),
+        ('conversations/conv_3', '{broken'),
+        ('conversations/conv_4', {'x': 1}),
+    ]
+
+
+def other_formats(outdir):
+    xml = sbr_xml()
+    with open(os.path.join(outdir, 'sbr-2026-01-15.xml'), 'w', encoding='utf-8', newline='') as f:
+        f.write(xml)
+    with zipfile.ZipFile(os.path.join(outdir, 'sbr-zipped.zip'), 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('sms-20260115120000.xml', xml.encode('utf-8'))
+    with zipfile.ZipFile(os.path.join(outdir, 'wonder-2026-01-15.zip'), 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('Messages_Backup_2026-01-15.xml', wonder_xml().encode('utf-8'))
+        z.writestr('mms_attachments/mms_1_1.jpg', bytes(rng.randrange(256) for _ in range(3000)))
+        z.writestr('mms_attachments/mms_3_2.pdf', PDF)
+    sms_xml, mms_xml = pom_files()
+    with zipfile.ZipFile(os.path.join(outdir, 'pom-2026-01-15.zip'), 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('_pom_backup_manifest.json', '{"version": 1, "note": "made-up test data"}')
+        z.writestr('sms.xml', sms_xml.encode('utf-8'))
+        z.writestr('mms.xml', mms_xml.encode('utf-8'))
+    with zipfile.ZipFile(os.path.join(outdir, 'buggy-2026-01-15.zip'), 'w', zipfile.ZIP_DEFLATED) as z:
+        for name, obj in buggy_entries():
+            if obj is None:
+                z.writestr(name, b'')
+            else:
+                z.writestr(name, (obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)).encode('utf-8'))
 
 
 if __name__ == '__main__':
